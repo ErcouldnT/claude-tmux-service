@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-tmux</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/claude-remote-start.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Equivalent of systemd Restart=always -->
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Equivalent of systemd KillMode=process: don't take the tmux
+         server down when the watchdog is stopped. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TERM</key>
+        <string>xterm-256color</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/claude-tmux.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/claude-tmux.log</string>
+</dict>
+</plist>

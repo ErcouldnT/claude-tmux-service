@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Code Remote Control session in tmux
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=TERM=xterm-256color
+ExecStart=%h/.local/bin/claude-remote-start.sh
+ExecStop=%h/.local/bin/claude-remote-start.sh stop
+# Only kill the watchdog on stop/restart; the shared tmux server may
+# host other sessions and must survive.
+KillMode=process
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

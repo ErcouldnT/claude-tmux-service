@@ -1,0 +1,5 @@
+# Local overrides / editor cruft
+*.local
+*.bak
+*.swp
+.DS_Store
