@@ -134,6 +134,17 @@ systemctl --user restart claude-tmux.service
 journalctl --user -u claude-tmux.service -f
 ```
 
+> **Raspberry Pi OS (and any distro with `Storage=volatile`):** that
+> `journalctl --user` command comes back empty — always. Raspberry Pi OS ships
+> `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf` to spare the
+> SD card, and no per-user journal file is created at all. The watchdog's
+> output is not lost: it reaches the system journal, and `ForwardToSyslog=yes`
+> puts it in `/var/log/syslog`, which *does* survive reboots. Read it with:
+> ```sh
+> grep claude-tmux /var/log/syslog     # persistent, spans reboots
+> journalctl -b | grep claude-tmux     # this boot only
+> ```
+
 **macOS (launchd):**
 ```sh
 launchctl print gui/$(id -u)/com.claude-tmux | head
