@@ -43,7 +43,12 @@ Linux)
     echo "Warning: could not enable linger; service may not start until you log in." >&2
 
   systemctl --user daemon-reload
-  systemctl --user enable --now claude-tmux.service
+  systemctl --user enable claude-tmux.service
+  # Restart rather than `enable --now`: --now is a no-op when the service is
+  # already running, so re-running the installer to pick up a new version would
+  # report success while the old watchdog (and the claude it spawned) kept
+  # running untouched.
+  systemctl --user restart claude-tmux.service
   echo
   echo "Done. The service is running."
   echo "  Status:  systemctl --user status claude-tmux.service"
