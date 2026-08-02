@@ -1,5 +1,8 @@
 [Unit]
 Description=Claude Code Remote Control session in tmux
+# Note: network-online.target is not defined in the systemd *user* manager, so
+# these two lines are no-ops here. They are kept for correctness if the unit is
+# ever run system-wide; the real network wait happens in the script (nm-online).
 After=network-online.target
 Wants=network-online.target
 
