@@ -238,6 +238,10 @@ CLAUDE_TMUX_READY=remote-control is active
 
 # ceiling for the retry delay after repeated failures, seconds
 CLAUDE_TMUX_MAX_BACKOFF=300
+
+# answer claude's first-run "do you trust this folder?" prompt automatically,
+# which nothing else would answer in an unattended session; 0 to do it by hand
+CLAUDE_TMUX_AUTO_TRUST=1
 ```
 
 Re-run `./install.sh` (or restart the service) after editing.
@@ -329,6 +333,13 @@ session.
   `refreshToken` and sets `expiresAt: 0` in `~/.claude/.credentials.json` while
   `subscriptionType` still reads `pro`, so the file *looks* healthy. `claude
   auth status` reports `"loggedIn": false` regardless, on either platform.
+- **`tmux attach` shows a "Quick safety check: Is this a project you created or
+  one you trust?" prompt.** Claude Code asks this the first time it runs in a
+  directory and blocks on the answer, so Remote Control never starts — easy to
+  hit on a *second* machine, whose home directory has not been trusted yet. The
+  watchdog answers it for you and logs `answering the workspace trust prompt`;
+  claude saves the answer in `~/.claude.json`, so it only happens once. Set
+  `CLAUDE_TMUX_AUTO_TRUST=0` to answer it by hand instead.
 - **Session disappears after ~10 minutes offline.** By design: if the machine
   can't reach the network for ~10 minutes, `claude` times out and exits. The
   watchdog then recreates the session once connectivity is back.

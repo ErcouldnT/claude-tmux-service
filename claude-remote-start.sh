@@ -27,6 +27,7 @@
 #   CLAUDE_TMUX_NET_WAIT     network wait budget       (default: 55 seconds, 0 disables)
 #   CLAUDE_TMUX_READY        banner meaning "registered"
 #                            (default: remote-control is active)
+#   CLAUDE_TMUX_AUTO_TRUST   answer the workspace trust prompt (default: 1)
 #   CLAUDE_TMUX_MAX_BACKOFF  cap on the retry delay    (default: 300 seconds)
 set -u
 
@@ -45,6 +46,7 @@ INTERVAL="${CLAUDE_TMUX_INTERVAL:-30}"
 VERIFY="${CLAUDE_TMUX_VERIFY:-60}"
 NET_WAIT="${CLAUDE_TMUX_NET_WAIT:-55}"
 READY="${CLAUDE_TMUX_READY:-remote-control is active}"
+AUTO_TRUST="${CLAUDE_TMUX_AUTO_TRUST:-1}"
 MAX_BACKOFF="${CLAUDE_TMUX_MAX_BACKOFF:-300}"
 
 # How often to re-read the pane while verifying a fresh spawn.
@@ -91,6 +93,7 @@ verify_session() {
   [ "$VERIFY" -gt 0 ] || return 0
 
   waited=0
+  trust_answered=0
   while [ "$waited" -lt "$VERIFY" ]; do
     sleep "$VERIFY_STEP"
     waited=$((waited + VERIFY_STEP))
@@ -112,6 +115,33 @@ verify_session() {
       log "Run 'claude', then /login with your claude.ai subscription account."
       tmux kill-session -t "$SESSION" 2>/dev/null
       return 1
+    fi
+
+    # First launch in a directory claude has not seen before: it asks whether
+    # the folder is trusted and blocks on the answer, so Remote Control never
+    # starts. Nobody is watching an unattended session, so answer it here.
+    # Trusting $HOME adds nothing on top of the ARGS default of
+    # --dangerously-skip-permissions; set CLAUDE_TMUX_AUTO_TRUST=0 to opt out.
+    #
+    # Answer at most once per spawn: capture-pane reads the scrollback too, so
+    # the prompt stays visible after it is dismissed and an unguarded match
+    # would keep typing stray "1"s into the running session.
+    if [ "$trust_answered" -eq 0 ] && contains "$out" "trust this folder"; then
+      if [ "$AUTO_TRUST" = 0 ]; then
+        log "claude is waiting on the workspace trust prompt for $HOME."
+        log "Answer it once by hand, or drop CLAUDE_TMUX_AUTO_TRUST=0 to let the"
+        log "watchdog answer it. claude saves the answer either way."
+        tmux kill-session -t "$SESSION" 2>/dev/null
+        return 1
+      fi
+      log "answering the workspace trust prompt for $HOME"
+      # The digit picks "Yes, I trust this folder" regardless of which entry is
+      # preselected; Enter confirms if the digit did not already submit.
+      tmux send-keys -t "$SESSION" 1
+      sleep 1
+      tmux send-keys -t "$SESSION" Enter
+      trust_answered=1
+      continue
     fi
   done
 
