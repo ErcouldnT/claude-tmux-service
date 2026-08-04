@@ -239,8 +239,9 @@ CLAUDE_TMUX_READY=remote-control is active
 # ceiling for the retry delay after repeated failures, seconds
 CLAUDE_TMUX_MAX_BACKOFF=300
 
-# answer claude's first-run "do you trust this folder?" prompt automatically,
-# which nothing else would answer in an unattended session; 0 to do it by hand
+# answer claude's first-run gates automatically — the "do you trust this
+# folder?" prompt and the Bypass Permissions warning — which nothing else
+# would answer in an unattended session; 0 to answer them by hand
 CLAUDE_TMUX_AUTO_TRUST=1
 ```
 
@@ -284,8 +285,17 @@ tail -f ~/Library/Logs/claude-tmux.log
 ~/.local/bin/claude-remote-start.sh status
 # session 'pi5': running, registered with Remote Control
 ```
-Exits non-zero if the session is missing, or running but not registered — the
-one check that distinguishes "a session exists" from "my phone can see it".
+The one check that distinguishes "a session exists" from "my phone can see it".
+Exit codes: `0` registered, `1` missing or running-but-not-registered, `2`
+running but unconfirmable.
+
+That third state is real rather than a hedge. The evidence is the startup
+banner, which lives at the top of the pane's history, and `status` reads only
+that opening stretch — never the whole scrollback, because a live claude asked
+about its own banner puts the phrase back on screen, and a session that merely
+*discussed* the banner would then pass. Once the session has produced more
+output than tmux's `history-limit`, those opening lines are gone; absence stops
+being evidence and `status` says so instead of guessing.
 
 **Attach to the live session (any platform):**
 ```sh
@@ -333,13 +343,24 @@ session.
   `refreshToken` and sets `expiresAt: 0` in `~/.claude/.credentials.json` while
   `subscriptionType` still reads `pro`, so the file *looks* healthy. `claude
   auth status` reports `"loggedIn": false` regardless, on either platform.
-- **`tmux attach` shows a "Quick safety check: Is this a project you created or
-  one you trust?" prompt.** Claude Code asks this the first time it runs in a
-  directory and blocks on the answer, so Remote Control never starts — easy to
-  hit on a *second* machine, whose home directory has not been trusted yet. The
-  watchdog answers it for you and logs `answering the workspace trust prompt`;
-  claude saves the answer in `~/.claude.json`, so it only happens once. Set
-  `CLAUDE_TMUX_AUTO_TRUST=0` to answer it by hand instead.
+- **`tmux attach` shows a prompt waiting for an answer** — "Quick safety check:
+  Is this a project you created or one you trust?", or the pink "Claude Code
+  running in Bypass Permissions mode" warning. Claude Code puts both in front of
+  a machine's first run and blocks on them, so Remote Control never starts and
+  the session is recycled every minute. Easy to hit on a *second* machine, whose
+  home directory has not been trusted yet, and the Bypass warning is guaranteed
+  as long as `CLAUDE_TMUX_ARGS` keeps its `--dangerously-skip-permissions`
+  default. The watchdog answers both and logs `answering the …`; claude saves
+  the answers in `~/.claude.json`, so each fires once per machine. Set
+  `CLAUDE_TMUX_AUTO_TRUST=0` to answer them by hand instead.
+
+  Note the two menus number their entries in opposite orders — the trust prompt
+  leads with "Yes, I trust this folder", the Bypass warning with "No, exit" — so
+  each is answered by name, not by position.
+- **macOS pops "Terminal wants to access files in your Desktop folder"
+  dialogs.** That is macOS's own privacy gate, not Claude Code's, triggered the
+  first time the session touches those directories. Approve them once; they are
+  per-folder and do not come back.
 - **Session disappears after ~10 minutes offline.** By design: if the machine
   can't reach the network for ~10 minutes, `claude` times out and exits. The
   watchdog then recreates the session once connectivity is back.

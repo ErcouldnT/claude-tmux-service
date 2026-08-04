@@ -27,7 +27,7 @@
 #   CLAUDE_TMUX_NET_WAIT     network wait budget       (default: 55 seconds, 0 disables)
 #   CLAUDE_TMUX_READY        banner meaning "registered"
 #                            (default: remote-control is active)
-#   CLAUDE_TMUX_AUTO_TRUST   answer the workspace trust prompt (default: 1)
+#   CLAUDE_TMUX_AUTO_TRUST   answer claude's first-run gates (default: 1)
 #   CLAUDE_TMUX_MAX_BACKOFF  cap on the retry delay    (default: 300 seconds)
 set -u
 
@@ -67,6 +67,41 @@ pane_text() {
   tmux capture-pane -t "$SESSION" -p -S - 2>/dev/null
 }
 
+# How much of the pane's opening output counts as "startup", for pane_head.
+HEAD_LINES=100
+
+pane_prop() {
+  tmux display-message -p -t "$SESSION" "$1" 2>/dev/null
+}
+
+# The banner is printed once, at startup, so it sits at the very top of the
+# pane's history. Read only that opening stretch. Scanning the whole scrollback
+# instead also matches the phrase turning up in the session's *own* output —
+# and since this session is itself a claude that can be asked about its own
+# banner, a full-scrollback check reports "registered" no matter what is true.
+pane_head() {
+  size=$(pane_prop '#{history_size}')
+  case "${size:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if [ "$size" -le "$HEAD_LINES" ]; then
+    pane_text
+  else
+    tmux capture-pane -t "$SESSION" -p -S "-$size" -E "$((HEAD_LINES - size))" 2>/dev/null
+  fi
+}
+
+# Once the history is full tmux drops its oldest lines, taking the startup
+# banner with them — absence stops being evidence at that point.
+history_trimmed() {
+  size=$(pane_prop '#{history_size}')
+  limit=$(pane_prop '#{history_limit}')
+  case "${size:-}${limit:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$size" -ge "$limit" ]
+}
+
 contains() {
   case "$1" in
     *"$2"*) return 0 ;;
@@ -86,6 +121,25 @@ network_ready() {
   nm-online -q -t "$NET_WAIT"
 }
 
+# Answer one of claude's first-run gates by picking menu entry $1. $2 names the
+# gate in the log. Returns 1, session already killed, when auto-answering is
+# switched off, so the caller can fail the spawn with the reason on record.
+answer_gate() {
+  if [ "$AUTO_TRUST" = 0 ]; then
+    log "claude is waiting on the $2 for $HOME."
+    log "Answer it once by hand, or drop CLAUDE_TMUX_AUTO_TRUST=0 to let the"
+    log "watchdog answer it. claude saves the answer either way."
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    return 1
+  fi
+  log "answering the $2 for $HOME"
+  # Pick by number rather than by position: the two menus disagree about which
+  # entry comes first, and Bypass Permissions leads with "No, exit".
+  tmux send-keys -t "$SESSION" "$1"
+  sleep 1
+  tmux send-keys -t "$SESSION" Enter
+}
+
 # Confirm that a freshly spawned session actually registered with Remote
 # Control. Returns 0 once the banner appears; otherwise kills the session so
 # the next watchdog pass starts from a clean slate.
@@ -94,6 +148,7 @@ verify_session() {
 
   waited=0
   trust_answered=0
+  bypass_answered=0
   while [ "$waited" -lt "$VERIFY" ]; do
     sleep "$VERIFY_STEP"
     waited=$((waited + VERIFY_STEP))
@@ -117,30 +172,26 @@ verify_session() {
       return 1
     fi
 
-    # First launch in a directory claude has not seen before: it asks whether
-    # the folder is trusted and blocks on the answer, so Remote Control never
-    # starts. Nobody is watching an unattended session, so answer it here.
-    # Trusting $HOME adds nothing on top of the ARGS default of
-    # --dangerously-skip-permissions; set CLAUDE_TMUX_AUTO_TRUST=0 to opt out.
+    # A machine's first launch hits one-time gates that block until answered,
+    # and an unattended session has nobody to answer them: the workspace trust
+    # prompt, then — because the default ARGS pass
+    # --dangerously-skip-permissions — the Bypass Permissions warning. claude
+    # saves both answers, so each fires once per machine. Answering grants
+    # nothing those defaults do not already grant; CLAUDE_TMUX_AUTO_TRUST=0
+    # opts out and fails the spawn with the reason logged instead.
     #
-    # Answer at most once per spawn: capture-pane reads the scrollback too, so
-    # the prompt stays visible after it is dismissed and an unguarded match
-    # would keep typing stray "1"s into the running session.
+    # Answer each at most once per spawn: capture-pane reads the scrollback
+    # too, so a dismissed prompt stays matchable and an unguarded match would
+    # keep typing stray digits into the running session.
     if [ "$trust_answered" -eq 0 ] && contains "$out" "trust this folder"; then
-      if [ "$AUTO_TRUST" = 0 ]; then
-        log "claude is waiting on the workspace trust prompt for $HOME."
-        log "Answer it once by hand, or drop CLAUDE_TMUX_AUTO_TRUST=0 to let the"
-        log "watchdog answer it. claude saves the answer either way."
-        tmux kill-session -t "$SESSION" 2>/dev/null
-        return 1
-      fi
-      log "answering the workspace trust prompt for $HOME"
-      # The digit picks "Yes, I trust this folder" regardless of which entry is
-      # preselected; Enter confirms if the digit did not already submit.
-      tmux send-keys -t "$SESSION" 1
-      sleep 1
-      tmux send-keys -t "$SESSION" Enter
+      answer_gate 1 "workspace trust prompt" || return 1
       trust_answered=1
+      continue
+    fi
+
+    if [ "$bypass_answered" -eq 0 ] && contains "$out" "Bypass Permissions mode"; then
+      answer_gate 2 "Bypass Permissions warning" || return 1
+      bypass_answered=1
       continue
     fi
   done
@@ -213,8 +264,14 @@ case "${1:-run}" in
       echo "session '$SESSION': not running"
       exit 1
     fi
-    if contains "$(pane_text)" "$READY"; then
+    if contains "$(pane_head)" "$READY"; then
       echo "session '$SESSION': running, registered with Remote Control"
+    elif history_trimmed; then
+      # Exit 2, not 0 or 1: nothing is known to be wrong, but nothing is
+      # confirmed either, and a caller should be able to tell those apart.
+      echo "session '$SESSION': running; registration unconfirmed — the startup"
+      echo "output has scrolled out of the tmux history. Check the Claude app."
+      exit 2
     else
       echo "session '$SESSION': running but NOT registered with Remote Control"
       exit 1
