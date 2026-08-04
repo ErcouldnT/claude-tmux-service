@@ -7,7 +7,8 @@ Claude mobile app or [claude.ai/code](https://claude.ai/code) at any time, and
 it comes back on its own after crashes, network drops, or reboots.
 
 Works anywhere Claude Code runs: any **systemd** Linux (Arch, Raspberry Pi OS /
-Debian, Fedora, …) and **macOS** (launchd).
+Debian, Fedora, …) and **macOS** (launchd), on both x86-64 and ARM64 — including
+Apple Silicon and the Raspberry Pi.
 
 ## How it works
 
@@ -53,37 +54,159 @@ Repeated failures back off — the retry delay doubles up to
 renamed) costs one attempt every few minutes instead of spinning at full rate
 indefinitely.
 
-## Requirements
+## Platform support
 
-- **tmux**
-- **Claude Code** ≥ 2.1.51 (`claude --version`)
-- A **claude.ai Pro or Max** login (`claude` → `/login`). Remote Control does
-  **not** work with API keys or `ANTHROPIC_BASE_URL` pointing away from
-  `api.anthropic.com`.
-- Linux: a systemd **user** session. macOS: launchd (built in).
-- Optional: **`nm-online`** (ships with NetworkManager; present on Arch,
-  Raspberry Pi OS / Debian Bookworm+, Fedora, …) for the pre-spawn network
-  wait. Without it the post-spawn verification still covers you.
+|                     | Linux                                                        | macOS                                                             |
+| ------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------- |
+| **OS**              | any distro with **systemd** (Arch, Raspberry Pi OS / Debian, Ubuntu, Fedora, …) | **macOS 13.0+** (Ventura or newer)              |
+| **Architecture**    | x86-64 or ARM64                                              | Apple Silicon (M1/M2/M3/M4) or Intel — both native                 |
+| **Service manager** | systemd **user** unit                                        | launchd **LaunchAgent**                                            |
+| **Unit installed to** | `~/.config/systemd/user/claude-tmux.service`               | `~/Library/LaunchAgents/com.claude-tmux.plist`                     |
+| **Runs without you logged in** | yes — installer runs `loginctl enable-linger`     | **no** — needs a GUI login, see [macOS notes](#macos-notes)         |
+| **Pre-spawn network wait** | yes, via `nm-online`                                  | skipped; post-spawn verification covers it                         |
+| **Logs**            | `journalctl --user -u claude-tmux.service`                   | `~/Library/Logs/claude-tmux.log`                                   |
+
+Nothing in this repo is compiled — it is POSIX `sh` plus one unit file — so the
+CPU architecture never matters on its own. An Apple Silicon MacBook and a
+Raspberry Pi run the exact same script.
 
 ## Install
 
+From a bare machine to a running session, on Linux and macOS alike:
+
 ```sh
-git clone https://github.com/<you>/claude-tmux-service.git
+git clone https://github.com/ErcouldnT/claude-tmux-service.git
 cd claude-tmux-service
 ./install.sh
 ```
 
-One command on both platforms — `install.sh` detects the OS and wires up
-systemd or launchd accordingly. It:
+`install.sh` detects the OS with `uname -s` and does the whole job:
 
-1. copies `claude-remote-start.sh` to `~/.local/bin/`
-2. installs the service unit (systemd user unit, or a launchd LaunchAgent)
-3. on Linux, enables lingering so the service survives logout / reboot
-4. starts the service immediately
+1. **installs tmux** if it is missing, using whichever package manager it finds
+   — `pacman`, `apt-get`, `dnf`, `zypper`, `apk`, or `brew`. On a fresh Mac with
+   no Homebrew it offers to install that first, since macOS ships no package
+   manager and there is otherwise no way to get tmux.
+2. **installs Claude Code** if `claude` is not on `PATH`, with the official
+   installer (`curl -fsSL https://claude.ai/install.sh | bash`). No `sudo`.
+3. **checks that you are logged in**, and runs the login flow for you if you are
+   not — see [Login](#login) below.
+4. copies `claude-remote-start.sh` to `~/.local/bin/`
+5. installs the service unit (systemd user unit, or a launchd LaunchAgent)
+6. on Linux, enables lingering so the service survives logout / reboot
+7. starts the service — and **restarts** it if it was already running, so
+   re-running the installer really does pick up a new version
+
+Re-running `./install.sh` after `git pull` is the supported upgrade path.
+
+Every command that needs elevation is printed before it runs, and on a terminal
+you are asked before anything is installed. Nothing happens behind your back.
+
+### Options
+
+| Flag         | Effect                                                          |
+| ------------ | --------------------------------------------------------------- |
+| *(none)*     | install what's missing, log in if needed, install the service     |
+| `--no-deps`  | install nothing; stop with a package-manager hint if tmux is missing |
+| `--no-login` | skip the login check entirely                                     |
+| `-y`, `--yes`| never pause for confirmation — for unattended provisioning        |
+
+With no terminal attached (a provisioning script, CI) the installer never
+blocks: it proceeds without prompting, and skips the interactive login instead
+of hanging on it.
+
+### Check it
+
+```sh
+~/.local/bin/claude-remote-start.sh status
+# session 'pi5': running, registered with Remote Control
+```
 
 Then, from your phone or browser, open the session (named after your machine's
 hostname by default) in the Claude app under **Code** — it shows a laptop icon
 with a green **Connected** dot.
+
+## Login
+
+Remote Control needs a **claude.ai Pro or Max** subscription login. The
+installer checks with `claude auth status --json`, which is the portable way to
+ask: on macOS the credentials live in the encrypted Keychain, on Linux in
+`~/.claude/.credentials.json`, and that command reads whichever applies.
+
+If you are not logged in and a terminal is attached, the installer runs
+`claude auth login` for you. It opens a browser; over SSH no browser opens, so
+copy the URL it prints, approve it, and paste the code back.
+
+You can always do it by hand:
+
+```sh
+claude auth login     # sign in
+claude auth status    # check
+```
+
+> **⚠️ Two credentials that look fine but cannot host a session.** The installer
+> warns about both, because the watchdog would otherwise retry forever on a
+> machine that reports itself as logged in:
+>
+> - **`CLAUDE_CODE_OAUTH_TOKEN`** — the long-lived token from
+>   `claude setup-token`. It is the obvious choice for headless automation, and
+>   it does not work here: it can only make model requests, and
+>   [cannot establish Remote Control sessions](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token).
+> - **`ANTHROPIC_API_KEY`** / **`ANTHROPIC_AUTH_TOKEN`** — these take precedence
+>   over your subscription login, and Remote Control needs the subscription.
+>   `unset` them.
+>
+> `ANTHROPIC_BASE_URL` pointing away from `api.anthropic.com` breaks it too.
+
+A login that expires while nobody is watching stops the session for good —
+Claude Code warns three days ahead at startup, and
+`claude-remote-start.sh status` will start reporting the session as not
+registered. Re-run `claude auth login` to renew.
+
+## Requirements
+
+Handled for you by `install.sh`, listed here for reference:
+
+- **tmux**
+- **Claude Code** ≥ 2.1.51 (`claude --version`)
+- a claude.ai **Pro or Max** login
+- Optional: **`nm-online`** (ships with NetworkManager; present on Arch,
+  Raspberry Pi OS / Debian Bookworm+, Fedora, …) for the pre-spawn network
+  wait. Without it the post-spawn verification still covers you.
+
+## macOS notes
+
+Everything below is specific to macOS; Linux users can skip this section.
+
+**The service only runs while you are logged in.** A LaunchAgent lives in the
+`gui/$(id -u)` domain, which exists only once a user has logged in to the
+desktop. There is no macOS equivalent of `loginctl enable-linger`: after a
+reboot, the session comes back when you log in, not at the login window. If you
+need a Mac that reconnects with nobody logged in, that requires a *LaunchDaemon*
+running as root — out of scope here, since Claude Code's credentials are
+per-user.
+
+**A laptop that sleeps drops the session.** Closing the lid suspends tmux and
+`claude` along with everything else, and the machine goes offline in the Claude
+app. On wake, the watchdog notices within one interval and reconnects — but if
+you want a MacBook to stay reachable, keep it awake and on power:
+
+```sh
+caffeinate -s          # foreground: prevent sleep while this runs (AC power only)
+sudo pmset -c sleep 0  # persistent: never sleep while on the power adapter
+pmset -g              # check current settings
+```
+
+Closing the lid still sleeps the machine regardless, unless it is in clamshell
+mode — external display plus power connected.
+
+**Pick a nicer session name.** The default is `hostname -s`, and macOS derives
+that from the computer's name, so "Erkut's MacBook Pro" becomes
+`Erkuts-MacBook-Pro` — long and awkward in the Claude app. Set something short
+in `~/.config/claude-tmux/env`:
+
+```sh
+CLAUDE_TMUX_SESSION=mbp
+```
 
 ## Configuration
 
@@ -172,8 +295,26 @@ tmux attach -t "$(hostname -s)"     # or your CLAUDE_TMUX_SESSION
 ./uninstall.sh
 ```
 
-Stops and removes the service and the script. Your `~/.config/claude-tmux/`
-config, if any, is left untouched.
+Detects the OS the same way the installer does, then stops the tmux session and
+removes the service (systemd unit or LaunchAgent) and the script.
+
+It deliberately removes only what this repo installed. Your
+`~/.config/claude-tmux/` config is left alone, and so are tmux and Claude Code —
+even if `install.sh` was the thing that installed them, they are ordinary
+packages you may well be using for something else.
+
+## Tests
+
+```sh
+sh tests/install.test.sh
+```
+
+Runs `install.sh` end to end against stubbed tools in a throwaway `HOME`,
+covering both platforms: the systemd and launchd paths, the auto-install and
+`--no-deps` paths, logged-in / logged-out / wrong-credential-kind handling, and
+that a re-run really restarts the service. It touches nothing outside its
+temporary directory, so it is safe to run on the machine that hosts a live
+session.
 
 ## Troubleshooting
 
@@ -182,17 +323,12 @@ config, if any, is left untouched.
   connected local session shows a **laptop icon + green dot**. See the
   [icon meaning in the docs](https://code.claude.com/docs/en/remote-control#connect-from-another-device).
 - **Nothing shows up in the app, and the logs repeat "claude exited Ns after
-  starting".** The account is logged out. Remote Control needs a claude.ai
-  subscription session, and the OAuth tokens in `~/.claude/.credentials.json`
-  can be dropped by a failed refresh — leaving `accessToken`/`refreshToken`
-  empty and `expiresAt: 0` while `subscriptionType` still reads `pro`, so
-  everything *looks* fine. Run `claude`: the footer says **"Not logged in ·
-  Run /login"** and the header shows *API Usage Billing* instead of your plan.
-  Fix with `/login`. On a headless box you can do this over SSH: start
-  `tmux new-session -d -s login claude`, `tmux send-keys -t login "/login"
-  Enter`, read the OAuth URL out of `tmux capture-pane -p -t login`, approve it
-  in a browser, then paste the code back with `tmux send-keys -t login -l
-  '<code>'`.
+  starting".** The account is logged out. Check with `claude auth status` and
+  fix with `claude auth login` — both work fine over SSH. The failure is easy to
+  miss on Linux, where a failed token refresh empties `accessToken` /
+  `refreshToken` and sets `expiresAt: 0` in `~/.claude/.credentials.json` while
+  `subscriptionType` still reads `pro`, so the file *looks* healthy. `claude
+  auth status` reports `"loggedIn": false` regardless, on either platform.
 - **Session disappears after ~10 minutes offline.** By design: if the machine
   can't reach the network for ~10 minutes, `claude` times out and exits. The
   watchdog then recreates the session once connectivity is back.
