@@ -41,8 +41,11 @@ new_case() {
   echo; echo "== $CASE =="
 }
 
+# CLAUDE_TMUX_EXTRA_PATH= drops the Homebrew/linuxbrew dirs install.sh would
+# otherwise prepend, so a real host tmux/claude in /opt/homebrew/bin can't leak
+# into a case that stubs — or deliberately omits — those tools.
 run() {
-  env -i HOME="$HOME_DIR" USER=tester PATH="$SAFEBIN" \
+  env -i HOME="$HOME_DIR" USER=tester PATH="$SAFEBIN" CLAUDE_TMUX_EXTRA_PATH= \
     sh "$REPO/install.sh" "$@" >"$OUT" 2>&1
   echo "$?" > "$ROOT/$CASE/rc"
 }
@@ -51,7 +54,7 @@ run_env() { # run with extra env: run_env VAR=x VAR2=y -- args...
   while [ "$1" != "--" ]; do extra="$extra $1"; shift; done
   shift
   # shellcheck disable=SC2086
-  env -i HOME="$HOME_DIR" USER=tester PATH="$SAFEBIN" $extra \
+  env -i HOME="$HOME_DIR" USER=tester PATH="$SAFEBIN" CLAUDE_TMUX_EXTRA_PATH= $extra \
     sh "$REPO/install.sh" "$@" >"$OUT" 2>&1
   echo "$?" > "$ROOT/$CASE/rc"
 }

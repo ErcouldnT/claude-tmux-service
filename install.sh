@@ -14,8 +14,14 @@ BIN_DIR="$HOME/.local/bin"
 SCRIPT="claude-remote-start.sh"
 
 # The same search path the watchdog uses, so a Claude Code we install below is
-# found in this run without restarting the shell.
-PATH="$HOME/.local/bin:/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# found in this run without restarting the shell. The extra dirs are overridable
+# via CLAUDE_TMUX_EXTRA_PATH so the test suite can keep a real host tmux/claude
+# (Homebrew installs to /opt/homebrew/bin, which is listed here) from leaking
+# into a case meant to simulate their absence. Using ${VAR-default}, not :=,
+# lets a test set it empty to drop the extra dirs while leaving it unset in
+# normal use to pick up Homebrew and linuxbrew.
+EXTRA_PATH=${CLAUDE_TMUX_EXTRA_PATH-/home/linuxbrew/.linuxbrew/bin:/opt/homebrew/bin:/usr/local/bin}
+PATH="$HOME/.local/bin${EXTRA_PATH:+:$EXTRA_PATH}:$PATH"
 export PATH
 
 WITH_DEPS=1
