@@ -162,9 +162,19 @@ claude auth status    # check
 > `ANTHROPIC_BASE_URL` pointing away from `api.anthropic.com` breaks it too.
 
 A login that expires while nobody is watching stops the session for good —
-Claude Code warns three days ahead at startup, and
-`claude-remote-start.sh status` will start reporting the session as not
-registered. Re-run `claude auth login` to renew.
+Claude Code warns three days ahead at startup. When the watchdog then finds
+itself logged out it can't recover on its own (that needs an interactive
+login), so instead of spinning silently it:
+
+- raises a **desktop notification** telling you to log back in (macOS
+  `osascript`/`terminal-notifier`, Linux `notify-send`; set
+  `CLAUDE_TMUX_NOTIFY=0` to opt out), and
+- makes `claude-remote-start.sh status` report `not running — logged out of
+  claude.ai` with the exact command to fix it, rather than a bare "not
+  running".
+
+Re-run `claude auth login` to renew; the next successful spawn clears the
+logged-out state on its own.
 
 ## Requirements
 
@@ -247,6 +257,10 @@ CLAUDE_TMUX_MAX_BACKOFF=300
 # folder?" prompt and the Bypass Permissions warning — which nothing else
 # would answer in an unattended session; 0 to answer them by hand
 CLAUDE_TMUX_AUTO_TRUST=1
+
+# raise a desktop notification when a logout is detected — the one failure the
+# watchdog cannot fix on its own; 0 to stay silent and rely on the log
+CLAUDE_TMUX_NOTIFY=1
 ```
 
 Re-run `./install.sh` (or restart the service) after editing.

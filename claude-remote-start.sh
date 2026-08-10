@@ -48,9 +48,18 @@ NET_WAIT="${CLAUDE_TMUX_NET_WAIT:-55}"
 READY="${CLAUDE_TMUX_READY:-remote-control is active}"
 AUTO_TRUST="${CLAUDE_TMUX_AUTO_TRUST:-1}"
 MAX_BACKOFF="${CLAUDE_TMUX_MAX_BACKOFF:-300}"
+NOTIFY="${CLAUDE_TMUX_NOTIFY:-1}"
 
 # How often to re-read the pane while verifying a fresh spawn.
 VERIFY_STEP=5
+
+# A logout is the one failure the watchdog cannot fix on its own: restoring it
+# needs an interactive claude.ai login that an unattended service can't perform.
+# So when it's detected we leave a marker here — read back by `status` — and
+# raise a desktop notification, turning a silently dead service into one that
+# says why it stopped and how to revive it.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux"
+LOGOUT_MARK="$STATE_DIR/logged-out"
 
 # A stuck setup — logged out, no network, a renamed banner — fails identically
 # on every retry, and each retry emits the same handful of lines. Left alone
@@ -84,6 +93,44 @@ $_msg"
 log_reset() {
   LOG_SEEN=""
   LOG_NOTED_SUPPRESS=0
+  NOTIFIED=0
+}
+
+# Best-effort desktop notification, so a logout — which the watchdog cannot fix
+# on its own — reaches the person instead of only landing in the log. Tries the
+# common notifiers in turn and stays silent where none exists; never fails the
+# caller. Messages must stay free of double quotes for the osascript form.
+notify() {
+  [ "$NOTIFY" = 0 ] && return 0
+  _title="Claude Remote Control"
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    terminal-notifier -title "$_title" -message "$1" >/dev/null 2>&1
+  elif command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$1\" with title \"$_title\"" >/dev/null 2>&1
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send "$_title" "$1" >/dev/null 2>&1
+  fi
+  return 0
+}
+
+# Notify at most once per failure streak; log_reset clears the guard, so a
+# logout that recurs after a recovery notifies again rather than staying quiet.
+NOTIFIED=0
+notify_once() {
+  [ "$NOTIFIED" -eq 0 ] || return 0
+  NOTIFIED=1
+  notify "$1"
+}
+
+# Record / clear the "logged out" state that `status` reports. Both are
+# best-effort: a service that can't write its state dir should still run.
+mark_logged_out() {
+  mkdir -p "$STATE_DIR" 2>/dev/null && : > "$LOGOUT_MARK" 2>/dev/null
+  return 0
+}
+clear_logged_out() {
+  rm -f "$LOGOUT_MARK" 2>/dev/null
+  return 0
 }
 
 die() {
@@ -193,11 +240,16 @@ verify_session() {
     fi
 
     out=$(pane_text)
-    contains "$out" "$READY" && return 0
+    if contains "$out" "$READY"; then
+      clear_logged_out
+      return 0
+    fi
 
     if contains "$out" "must be logged in" || contains "$out" "Not logged in"; then
       log "claude reports it is not logged in; Remote Control cannot start."
       log "Run 'claude', then /login with your claude.ai subscription account."
+      mark_logged_out
+      notify_once "Logged out of claude.ai — run 'claude auth login' to restore Remote Control."
       tmux kill-session -t "$SESSION" 2>/dev/null
       return 1
     fi
@@ -292,10 +344,16 @@ case "${1:-run}" in
     ;;
   status)
     if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      if [ -f "$LOGOUT_MARK" ]; then
+        echo "session '$SESSION': not running — logged out of claude.ai."
+        echo "Run 'claude auth login' with your Pro/Max account to restore it."
+        exit 1
+      fi
       echo "session '$SESSION': not running"
       exit 1
     fi
     if contains "$(pane_head)" "$READY"; then
+      clear_logged_out
       echo "session '$SESSION': running, registered with Remote Control"
     elif history_trimmed; then
       # Exit 2, not 0 or 1: nothing is known to be wrong, but nothing is

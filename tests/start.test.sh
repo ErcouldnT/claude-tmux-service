@@ -81,16 +81,29 @@ STUB
   # stub tmux never actually runs the new-session command line.
   printf '#!/bin/sh\n:\n' > "$STUBS/claude"
   printf '#!/bin/sh\n:\n' > "$STUBS/sleep"
-  chmod +x "$STUBS/tmux" "$STUBS/claude" "$STUBS/sleep"
+
+  # Stub the notifier the script reaches for first, so its logout notification
+  # is captured here instead of firing a real desktop alert off this box —
+  # osascript is a live binary on the macOS running these tests. Recording the
+  # message lets a case assert on it.
+  cat > "$STUBS/terminal-notifier" <<STUB
+#!/bin/sh
+printf '%s\n' "\$*" >> "$STATE/notify"
+STUB
+  chmod +x "$STUBS/tmux" "$STUBS/claude" "$STUBS/sleep" "$STUBS/terminal-notifier"
 }
 
 run_cmd() {
   cmd=$1; shift
   HOME="$HOME_DIR" STATE="$STATE" CLAUDE_TMUX_SESSION=test \
     XDG_CONFIG_HOME="$HOME_DIR/.config" \
+    XDG_STATE_HOME="$HOME_DIR/.local/state" \
     "$@" sh "$REPO/claude-remote-start.sh" "$cmd" >"$OUT" 2>&1
   RC=$?
 }
+
+# Where mark_logged_out drops its marker, given the XDG_STATE_HOME above.
+logout_mark() { echo "$HOME_DIR/.local/state/claude-tmux/logged-out"; }
 
 # Each writes its screen to the file named by $1, so a case can build up the
 # scrollback the way claude does: a dismissed prompt scrolls up, it does not
@@ -190,6 +203,14 @@ run_cmd start
 
 check "logged out is diagnosed"        'grep -q "not logged in" "$OUT"'
 check "logged out sends no gate keys"  '[ ! -s "$STATE/keys" ]'
+check "logged out notifies the user"   'grep -q "claude auth login" "$STATE/notify"'
+check "logged out marks the state"     '[ -f "$(logout_mark)" ]'
+
+# --- the logout notification fires once, not on every retry within a streak --
+# notify_once is guarded so a persistent logout doesn't spam desktop alerts;
+# the guard only clears once a spawn succeeds (log_reset). A single start goes
+# through verify once, so this asserts the guard holds across that pass.
+check "notifies exactly once"          '[ "$(wc -l < "$STATE/notify")" -eq 1 ]'
 
 echo
 echo "claude-remote-start.sh — status"
@@ -212,10 +233,12 @@ new_case status_registered
 : > "$STATE/session"
 echo 500 > "$STATE/hist"
 printf 'claude starting up\nremote-control is active\n' > "$STATE/head"
+mkdir -p "$(dirname "$(logout_mark)")"; : > "$(logout_mark)"  # a stale marker from an earlier logout
 run_cmd status
 
 check "a real startup banner registers" '[ "$RC" -eq 0 ]'
 check "reports registered"              'grep -q "running, registered" "$OUT"'
+check "clears a stale logout marker"    '[ ! -f "$(logout_mark)" ]'
 
 # --- a full history has dropped the banner, so absence proves nothing -------
 new_case status_trimmed
@@ -232,6 +255,15 @@ run_cmd status
 
 check "no session exits 1"     '[ "$RC" -eq 1 ]'
 check "reports not running"    'grep -q "not running" "$OUT"'
+
+# --- a recorded logout is surfaced by status, with the fix to hand -----------
+new_case status_logged_out
+mkdir -p "$(dirname "$(logout_mark)")"; : > "$(logout_mark)"
+run_cmd status
+
+check "logged-out status exits 1"    '[ "$RC" -eq 1 ]'
+check "names the logout"             'grep -q "logged out" "$OUT"'
+check "points at the login command"  'grep -q "claude auth login" "$OUT"'
 
 rm -rf "$ROOT"
 echo
