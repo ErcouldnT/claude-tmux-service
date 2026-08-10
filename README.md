@@ -52,7 +52,11 @@ skipped and step 2 does the work on its own.
 Repeated failures back off — the retry delay doubles up to
 `CLAUDE_TMUX_MAX_BACKOFF` — so a genuinely broken setup (logged out, banner
 renamed) costs one attempt every few minutes instead of spinning at full rate
-indefinitely.
+indefinitely. The log is deduplicated to match: within one failure streak each
+distinct message is written once and further repeats are suppressed, so a
+long-running broken state leaves a readable log instead of hundreds of copies
+of the same lines. The next message is logged afresh once the situation changes
+or a spawn finally succeeds.
 
 ## Platform support
 

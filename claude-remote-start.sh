@@ -52,8 +52,38 @@ MAX_BACKOFF="${CLAUDE_TMUX_MAX_BACKOFF:-300}"
 # How often to re-read the pane while verifying a fresh spawn.
 VERIFY_STEP=5
 
+# A stuck setup — logged out, no network, a renamed banner — fails identically
+# on every retry, and each retry emits the same handful of lines. Left alone
+# that floods the log with hundreds of copies of one situation. So within a
+# failure streak each distinct message is written once; repeats are dropped
+# until the streak ends. The run loop calls log_reset once a spawn succeeds, so
+# a situation that recurs later still gets logged afresh.
+LOG_SEEN=""
+LOG_NOTED_SUPPRESS=0
+
 log() {
-  echo "claude-tmux: $*" >&2
+  _msg="claude-tmux: $*"
+  # Quoting $_msg in the pattern matches it literally — no globbing. The
+  # leading newline anchors each entry so one message can't match inside
+  # another; every stored line therefore starts with a newline too.
+  case "$LOG_SEEN" in
+    *"
+$_msg"*)
+      if [ "$LOG_NOTED_SUPPRESS" -eq 0 ]; then
+        echo "claude-tmux: (repeating messages suppressed until the situation changes)" >&2
+        LOG_NOTED_SUPPRESS=1
+      fi
+      return ;;
+  esac
+  LOG_SEEN="$LOG_SEEN
+$_msg"
+  echo "$_msg" >&2
+}
+
+# Forget the current streak's messages so the next failure logs from scratch.
+log_reset() {
+  LOG_SEEN=""
+  LOG_NOTED_SUPPRESS=0
 }
 
 die() {
@@ -246,6 +276,7 @@ case "${1:-run}" in
     while :; do
       if ensure_session; then
         failures=0
+        log_reset
         sleep "$INTERVAL"
       else
         [ "$failures" -lt 32 ] && failures=$((failures + 1))
