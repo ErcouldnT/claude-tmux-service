@@ -357,21 +357,62 @@ tmux attach -t "$(hostname -s)"     # or your CLAUDE_TMUX_SESSION
 ./uninstall.sh
 ```
 
-Detects the OS the same way the installer does, then stops the tmux session and
-removes the service (systemd unit or LaunchAgent) and the script.
+Detects the OS the same way the installer does, then removes the service
+(systemd unit or LaunchAgent), stops the tmux session and deletes the script.
+That much always happens — it is what running this means. Everything else it
+asks about:
 
-It deliberately removes only what this repo installed. Your
-`~/.config/claude-tmux/` config is left alone, and so are tmux and Claude Code —
-even if `install.sh` was the thing that installed them, they are ordinary
-packages you may well be using for something else.
+| Question | Default |
+| --- | --- |
+| Remove `~/.config/claude-tmux/` | yes |
+| Remove the watchdog's state dir | yes |
+| Disable `loginctl` lingering | yes |
+| Log out of claude.ai | **no** |
+| Uninstall Claude Code | **no** |
+| Delete `~/.claude` and `~/.claude.json` | **no** |
+| Uninstall tmux | **no** |
+
+The split is the point. The first three are things this service put there, so
+an unattended run cleans them up. The rest are shared with the whole machine —
+uninstalling tmux takes out every other tmux session on the box, and logging
+out affects every use of Claude Code, not just this one. Those need an explicit
+yes: with no terminal to ask, the answer is no.
+
+```sh
+./uninstall.sh                  # ask about each of the above
+./uninstall.sh --yes            # the service and its own leftovers, nothing shared
+./uninstall.sh --all            # everything, including Claude Code and tmux
+./uninstall.sh --yes --logout   # or pick individually
+```
+
+`--keep-config`, `--keep-state` and `--keep-linger` opt out one at a time;
+`--logout`, `--remove-claude`, `--remove-data` and `--remove-tmux` opt in.
+
+Two orderings matter and are covered by the tests. The service is stopped
+**before** its session is killed — reverse them and the still-running watchdog
+does what it is built to do, spawning a replacement session that outlives the
+uninstall. And the logout runs **before** Claude Code is removed, since the
+logout goes through that binary; the other way round leaves credentials on disk
+with nothing left to clear them.
+
+Lingering is asked about rather than simply undone: `install.sh` turns it on,
+but it is a per-user machine setting, and anything else you run as a user
+service is relying on it too.
 
 ## Tests
 
 ```sh
 sh tests/install.test.sh
+sh tests/start.test.sh
+sh tests/uninstall.test.sh
 ```
 
-Runs `install.sh` end to end against stubbed tools in a throwaway `HOME`,
+`uninstall.test.sh` covers what each flag does and does not touch, both
+orderings described above, the warning when other tmux sessions would be lost,
+and that a second run on an already-clean machine is a no-op rather than an
+error.
+
+`install.test.sh` runs `install.sh` end to end against stubbed tools in a throwaway `HOME`,
 covering both platforms: the systemd and launchd paths, the auto-install and
 `--no-deps` paths, logged-in / logged-out / wrong-credential-kind handling, and
 that a re-run really restarts the service. It touches nothing outside its
