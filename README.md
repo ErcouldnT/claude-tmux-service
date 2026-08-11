@@ -147,6 +147,36 @@ claude auth login     # sign in
 claude auth status    # check
 ```
 
+### `claude-remote-start.sh login`
+
+On a headless box, prefer this over `claude auth login`:
+
+```sh
+~/.local/bin/claude-remote-start.sh login
+```
+
+It walks Claude Code's whole first run — theme picker, login method, the
+sign-in, the two "press Enter" notices, the trust prompt, the Bypass warning —
+and stops only at the one step that genuinely needs a person: it prints the
+sign-in URL and waits for you to paste the code back. Then it drops the stale
+session so the watchdog rebuilds it within one interval.
+
+Two reasons it exists rather than pointing you at `claude auth login`:
+
+- **A CLI login does not clear a first run.** Onboarding runs its own sign-in
+  step and ignores the token the subcommand stored, so `claude auth status` can
+  report a healthy Pro login while every new session still opens on the
+  sign-in screen. Only finishing the run in the TUI settles it.
+- **The URL is unreadable as captured.** The TUI draws it itself, one screenful
+  per rendered line, so `capture-pane -J` has no wrap flags to rejoin and hands
+  back the first ~200 characters. A truncated OAuth URL fails at claude.com
+  with nothing to explain why. The URL is reassembled before you see it.
+
+Leaving the run unfinished is not harmless: `hasCompletedOnboarding` is only
+written once it reaches the end, so a session killed at the sign-in screen
+sends the machine back to the theme picker on every start, forever. `login`
+waits for that flag before reporting success.
+
 > **⚠️ Two credentials that look fine but cannot host a session.** The installer
 > warns about both, because the watchdog would otherwise retry forever on a
 > machine that reports itself as logged in:
@@ -375,6 +405,24 @@ session.
   Note the two menus number their entries in opposite orders — the trust prompt
   leads with "Yes, I trust this folder", the Bypass warning with "No, exit" — so
   each is answered by name, not by position.
+
+  A brand-new install shows a third gate first, the **theme picker**, which the
+  watchdog answers with "Auto (match terminal)".
+
+  These menus act on the number key alone, whatever their "Enter to confirm"
+  footer says. So the watchdog re-reads the *visible screen* after pressing the
+  digit and only sends Enter if the gate is still up. Confirming unconditionally
+  put the Enter on the following screen instead — and since the Bypass warning
+  follows the trust prompt and defaults to "No, exit", that stray keypress quit
+  claude a few seconds after every start, which reads in the log as `claude
+  exited 10s after starting` and is easy to misread as a login problem.
+- **Every start opens on the theme picker, or on the sign-in screen.** The first
+  run was never finished, so nothing was recorded: `hasCompletedOnboarding` is
+  absent from `~/.claude.json`. The sign-in step needs a person, and the
+  watchdog says so rather than burning its verification budget in front of a
+  screen that cannot advance. Run `claude-remote-start.sh login` to walk it
+  through — and note that `claude auth login` alone will *not* fix this, however
+  healthy `claude auth status` looks afterwards.
 - **macOS pops "Terminal wants to access files in your Desktop folder"
   dialogs.** That is macOS's own privacy gate, not Claude Code's, triggered the
   first time the session touches those directories. Approve them once; they are

@@ -36,6 +36,7 @@ new_case() {
   mkdir -p "$STUBS" "$STATE"
 
   : > "$STATE/pane"
+  : > "$STATE/screen"
   : > "$STATE/head"
   : > "$STATE/keys"
   echo 10   > "$STATE/hist"
@@ -49,9 +50,18 @@ case "$cmd" in
   new-session)  : > "$STATE/session" ;;
   kill-session) rm -f "$STATE/session" ;;
   capture-pane)
-    # A capture with -E is pane_head asking for the opening history only;
-    # without it, pane_text asking for everything.
-    if [ $# -ge 8 ]; then cat "$STATE/head"; else cat "$STATE/pane"; fi
+    # Three shapes, told apart by argument count: -E is pane_head asking for
+    # the opening history; a bare -p is pane_screen asking for the visible
+    # screen; anything else is pane_text asking for the whole scrollback. A
+    # case that never sets a screen gets the scrollback, which is what the
+    # cases written before screens existed expect.
+    if [ $# -ge 8 ]; then
+      cat "$STATE/head"
+    elif [ $# -le 4 ]; then
+      if [ -s "$STATE/screen" ]; then cat "$STATE/screen"; else cat "$STATE/pane"; fi
+    else
+      cat "$STATE/pane"
+    fi
     ;;
   display-message)
     # display-message -p -t <session> <format>
@@ -64,14 +74,22 @@ case "$cmd" in
   send-keys)
     # send-keys -t <session> <key>
     printf '%s\n' "$4" >> "$STATE/keys"
-    if [ "$4" = Enter ]; then
-      n=$(cat "$STATE/step" 2>/dev/null || echo 0)
-      n=$((n + 1))
-      if [ -f "$STATE/step$n" ]; then
-        cat "$STATE/step$n" > "$STATE/pane"
-        echo "$n" > "$STATE/step"
-      fi
-    fi
+    # Digits advance as well as Enter: claude's menus act on the number key
+    # alone, which is the whole reason answer_gate has to check afterwards
+    # whether the gate is still up before confirming.
+    case "$4" in
+      Enter|[0-9])
+        n=$(cat "$STATE/step" 2>/dev/null || echo 0)
+        n=$((n + 1))
+        if [ -f "$STATE/step$n" ]; then
+          cat "$STATE/step$n" > "$STATE/pane"
+          # screenN is what is left on screen after that advance; without one
+          # the screen just follows the scrollback.
+          if [ -f "$STATE/screen$n" ]; then cat "$STATE/screen$n" > "$STATE/screen"; fi
+          echo "$n" > "$STATE/step"
+        fi
+        ;;
+    esac
     ;;
   *) echo "stub tmux: unexpected command: $cmd" >&2; exit 64 ;;
 esac
@@ -108,6 +126,18 @@ logout_mark() { echo "$HOME_DIR/.local/state/claude-tmux/logged-out"; }
 # Each writes its screen to the file named by $1, so a case can build up the
 # scrollback the way claude does: a dismissed prompt scrolls up, it does not
 # disappear.
+theme_prompt() {
+  cat >> "$1" <<'PANE'
+Welcome to Claude Code v2.1.227
+Let's get started.
+Choose the text style that looks best with your terminal
+To change this later, run /theme
+  1. Auto (match terminal)
+> 2. Dark mode
+  3. Light mode
+PANE
+}
+
 trust_prompt() {
   cat >> "$1" <<'PANE'
 Accessing workspace:
@@ -125,6 +155,15 @@ In Bypass Permissions mode, Claude Code will not ask for your approval before
 running potentially dangerous commands.
 > 1. No, exit
   2. Yes, I accept
+PANE
+}
+
+signin_prompt() {
+  cat >> "$1" <<'PANE'
+Claude Code can be used with your Claude subscription or billed based on API
+Select login method:
+> 1. Claude account with subscription
+  2. Anthropic Console account
 PANE
 }
 
@@ -162,17 +201,53 @@ check "picks 'Yes, I accept', not 'No'"  '[ "$(head -n1 "$STATE/keys")" = 2 ]'
 check "never sends the exit entry"       '! grep -qx 1 "$STATE/keys"'
 check "says what it did"                 'grep -q "answering the Bypass Permissions warning" "$OUT"'
 
-# --- both gates in a row, which is what a fresh machine actually shows ------
-new_case both_gates
-trust_prompt "$STATE/pane"
-trust_prompt "$STATE/step1"; bypass_prompt "$STATE/step1"
-cat "$STATE/step1" > "$STATE/step2"; banner "$STATE/step2"
+# --- the sign-in screen needs a person, so the watchdog must not sit on it --
+new_case signin
+signin_prompt "$STATE/pane"
 run_cmd start
 
-check "both gates get through"  '[ "$RC" -eq 0 ]'
-check "trust answered first"    '[ "$(head -n1 "$STATE/keys")" = 1 ]'
-check "bypass answered next"    'grep -qx 2 "$STATE/keys"'
-check "one digit per gate"      '[ "$(grep -cx "[12]" "$STATE/keys")" -eq 2 ]'
+check "sign-in fails the spawn"      '[ "$RC" -eq 1 ]'
+check "sign-in sends no gate keys"   '[ ! -s "$STATE/keys" ]'
+check "sign-in recycles the session" '[ ! -f "$STATE/session" ]'
+check "points at the login command"  'grep -q "login" "$OUT"'
+check "sign-in marks the state"      '[ -f "$(logout_mark)" ]'
+check "sign-in notifies the user"    'grep -q "sign-in" "$STATE/notify"'
+
+# --- the theme picker, which a brand-new install opens on -------------------
+new_case theme
+theme_prompt "$STATE/pane"
+theme_prompt "$STATE/step1"; banner "$STATE/step1"
+run_cmd start
+
+check "answered theme picker verifies"   '[ "$RC" -eq 0 ]'
+check "session left running"             '[ -f "$STATE/session" ]'
+check "picks 'Auto (match terminal)'"    '[ "$(head -n1 "$STATE/keys")" = 1 ]'
+check "says what it did"                 'grep -q "answering the theme picker" "$OUT"'
+
+# --- all three gates in a row, which is what a fresh machine actually shows -
+# Modelled the way claude really behaves: the number key alone dismisses each
+# menu. The scrollback accumulates, so every gate stays matchable there, while
+# the screen shows only the gate currently up. A watchdog that confirmed with
+# an unconditional Enter would land it on the *next* screen — and since the
+# Bypass warning that follows the trust prompt leads with "No, exit", that
+# stray Enter quits claude. So: three digits, and not one Enter.
+new_case all_gates
+theme_prompt "$STATE/pane"
+theme_prompt "$STATE/screen"
+theme_prompt "$STATE/step1"; trust_prompt "$STATE/step1"
+trust_prompt "$STATE/screen1"
+cat "$STATE/step1" > "$STATE/step2"; bypass_prompt "$STATE/step2"
+bypass_prompt "$STATE/screen2"
+cat "$STATE/step2" > "$STATE/step3"; banner "$STATE/step3"
+banner "$STATE/screen3"
+run_cmd start
+
+check "every gate gets through" '[ "$RC" -eq 0 ]'
+check "theme answered first"    '[ "$(head -n1 "$STATE/keys")" = 1 ]'
+check "trust answered next"     '[ "$(grep -x "[12]" "$STATE/keys" | sed -n 2p)" = 1 ]'
+check "bypass answered last"    '[ "$(grep -x "[12]" "$STATE/keys" | sed -n 3p)" = 2 ]'
+check "one digit per gate"      '[ "$(grep -cx "[12]" "$STATE/keys")" -eq 3 ]'
+check "no stray Enter is sent"  '! grep -qx Enter "$STATE/keys"'
 
 # --- a dismissed prompt lingers in the scrollback and must not be re-answered
 # Without a guard, every 5s pass would re-match the prompt text still sitting

@@ -18,6 +18,8 @@
 #   claude-remote-start.sh start    create the session once, verified, and exit
 #   claude-remote-start.sh stop     kill the tmux session
 #   claude-remote-start.sh status   report whether the session is registered
+#   claude-remote-start.sh login    sign in to claude.ai: prints the URL and
+#                                   relays the code you paste back
 #
 # Configuration (environment or ~/.config/claude-tmux/env):
 #   CLAUDE_TMUX_SESSION      tmux session name         (default: short hostname)
@@ -29,6 +31,7 @@
 #                            (default: remote-control is active)
 #   CLAUDE_TMUX_AUTO_TRUST   answer claude's first-run gates (default: 1)
 #   CLAUDE_TMUX_MAX_BACKOFF  cap on the retry delay    (default: 300 seconds)
+#   CLAUDE_TMUX_LOGIN_WAIT   budget for the `login` walkthrough (default: 600s)
 set -u
 
 # Cover the common install locations across distros and macOS:
@@ -179,6 +182,13 @@ history_trimmed() {
   [ "$size" -ge "$limit" ]
 }
 
+# Just the visible screen, no scrollback. What is on screen *now* is the only
+# way to tell whether a keypress advanced past a gate: the scrollback keeps
+# showing the gate either way.
+pane_screen() {
+  tmux capture-pane -t "$SESSION" -p 2>/dev/null
+}
+
 contains() {
   case "$1" in
     *"$2"*) return 0 ;;
@@ -213,8 +223,19 @@ answer_gate() {
   # Pick by number rather than by position: the two menus disagree about which
   # entry comes first, and Bypass Permissions leads with "No, exit".
   tmux send-keys -t "$SESSION" "$1"
-  sleep 1
-  tmux send-keys -t "$SESSION" Enter
+  sleep 2
+
+  # Then confirm — but only if the gate is still up. Some of these menus act on
+  # the digit alone and advance immediately, whatever their "Enter to confirm"
+  # footer says. An unconditional Enter therefore lands on whichever screen came
+  # next, and the screen after the trust prompt is the Bypass warning, which
+  # defaults to "No, exit": the stray Enter quits claude a few seconds after
+  # starting it. Matching on the visible screen, not the scrollback, is what
+  # makes "did it advance?" answerable at all — the scrollback shows the gate
+  # either way. $3 is the text that identified this gate.
+  if contains "$(pane_screen)" "$3"; then
+    tmux send-keys -t "$SESSION" Enter
+  fi
 }
 
 # Confirm that a freshly spawned session actually registered with Remote
@@ -224,6 +245,7 @@ verify_session() {
   [ "$VERIFY" -gt 0 ] || return 0
 
   waited=0
+  theme_answered=0
   trust_answered=0
   bypass_answered=0
   while [ "$waited" -lt "$VERIFY" ]; do
@@ -247,32 +269,57 @@ verify_session() {
 
     if contains "$out" "must be logged in" || contains "$out" "Not logged in"; then
       log "claude reports it is not logged in; Remote Control cannot start."
-      log "Run 'claude', then /login with your claude.ai subscription account."
+      log "Run '$0 login' to sign in — it drives 'claude auth login' for you,"
+      log "prints the URL, and takes the code you paste back."
       mark_logged_out
       notify_once "Logged out of claude.ai — run 'claude auth login' to restore Remote Control."
       tmux kill-session -t "$SESSION" 2>/dev/null
       return 1
     fi
 
+    # Setup's sign-in step is the one gate no watchdog can answer: it wants a
+    # URL opened in a browser and a code pasted back. Say so and stop, rather
+    # than burning the verification budget in front of a screen that will never
+    # advance on its own.
+    if contains "$out" "Select login method" || contains "$out" "Paste code here"; then
+      log "claude is waiting on its sign-in screen; this needs a person."
+      log "Run '$0 login' — it walks the first-run setup, prints the URL, and"
+      log "relays the code you paste back."
+      mark_logged_out
+      notify_once "Claude Code needs an interactive sign-in — run claude-remote-start.sh login"
+      tmux kill-session -t "$SESSION" 2>/dev/null
+      return 1
+    fi
+
     # A machine's first launch hits one-time gates that block until answered,
-    # and an unattended session has nobody to answer them: the workspace trust
-    # prompt, then — because the default ARGS pass
+    # and an unattended session has nobody to answer them: the theme picker,
+    # the workspace trust prompt, then — because the default ARGS pass
     # --dangerously-skip-permissions — the Bypass Permissions warning. claude
-    # saves both answers, so each fires once per machine. Answering grants
+    # saves every answer, so each fires once per machine. Answering grants
     # nothing those defaults do not already grant; CLAUDE_TMUX_AUTO_TRUST=0
     # opts out and fails the spawn with the reason logged instead.
     #
     # Answer each at most once per spawn: capture-pane reads the scrollback
     # too, so a dismissed prompt stays matchable and an unguarded match would
     # keep typing stray digits into the running session.
+
+    # A brand-new install opens on the theme picker, before anything else.
+    # Nothing downstream reads the theme and nobody watches this pane, so take
+    # "Auto (match terminal)" and leave the terminal's own colours alone.
+    if [ "$theme_answered" -eq 0 ] && contains "$out" "Choose the text style"; then
+      answer_gate 1 "theme picker" "Choose the text style" || return 1
+      theme_answered=1
+      continue
+    fi
+
     if [ "$trust_answered" -eq 0 ] && contains "$out" "trust this folder"; then
-      answer_gate 1 "workspace trust prompt" || return 1
+      answer_gate 1 "workspace trust prompt" "trust this folder" || return 1
       trust_answered=1
       continue
     fi
 
     if [ "$bypass_answered" -eq 0 ] && contains "$out" "Bypass Permissions mode"; then
-      answer_gate 2 "Bypass Permissions warning" || return 1
+      answer_gate 2 "Bypass Permissions warning" "Bypass Permissions mode" || return 1
       bypass_answered=1
       continue
     fi
@@ -322,6 +369,194 @@ retry_delay() {
   echo "$delay"
 }
 
+# --- interactive first-run / login -----------------------------------------
+# One step of a first run cannot be automated, by design: signing in needs a
+# person to open a URL in a browser and paste back the code. Everything around
+# it can be, and doing it by hand on a headless box is tedious — the URL
+# arrives split across three lines of a tmux pane, and the menus before and
+# after it have to be answered blind.
+#
+# So `login` drives the whole first run and asks for exactly the one thing only
+# a person can supply. It walks the menus, stops at the sign-in screen to print
+# the URL and read the code, and hands back to the watchdog once claude has
+# recorded the run as complete.
+#
+# It drives the real TUI rather than `claude auth login`, because onboarding
+# insists on its own sign-in step: a token stored by the CLI subcommand leaves
+# `claude auth status` reporting a healthy Pro login while the TUI still opens
+# on its sign-in screen and asks for a fresh code.
+#
+# Finishing matters as much as starting. Onboarding is only written down —
+# hasCompletedOnboarding in ~/.claude.json — once the run reaches the end, so a
+# session killed at the sign-in screen leaves the machine to start over from
+# the theme picker forever. That flag, not a guess about which screen is up, is
+# what this waits for.
+
+LOGIN_SESSION="${SESSION}-login"
+LOGIN_BUDGET="${CLAUDE_TMUX_LOGIN_WAIT:-600}"
+ONBOARD_STATE="$HOME/.claude.json"
+
+login_pane() {
+  tmux capture-pane -t "$LOGIN_SESSION" -p -J -S - 2>/dev/null
+}
+
+# Only the visible screen — see pane_screen. Gates are matched here, so a
+# dismissed menu sitting in the scrollback cannot be answered twice.
+login_screen() {
+  tmux capture-pane -t "$LOGIN_SESSION" -p 2>/dev/null
+}
+
+# Rebuild the sign-in URL from the pane.
+#
+# capture-pane -J rejoins what *tmux* wrapped, which is enough for ordinary
+# stdout — but the TUI draws the URL itself, emitting each screenful as its own
+# rendered line, and those carry no wrap flag for -J to act on. Handing over
+# only the first of them sends the person to a truncated URL that fails at
+# claude.com with no hint as to why. So: start at the https:// line and glue on
+# the lines that follow while they still look like URL (a single run of
+# non-blank characters). claude's own prose is indented and spaced, so the
+# first line with a space in it ends the URL.
+login_url() {
+  login_pane | awk '
+    /^https:\/\/[^ 	]*oauth/ { url = $0; more = 1; next }
+    more && /^[^ 	]+$/       { url = url $0; next }
+    more                      { more = 0 }
+    END { if (url != "") print url }
+  '
+}
+
+# Pick menu entry $1, named $2, identified on screen by $3. Same shape as
+# answer_gate, including why the Enter is conditional: these menus act on the
+# digit alone, and an Enter that arrives after the screen has moved on lands on
+# the next one — where it would answer the Bypass warning's "No, exit".
+login_pick() {
+  echo "  answering the $2" >&2
+  tmux send-keys -t "$LOGIN_SESSION" "$1"
+  sleep 2
+  if contains "$(login_screen)" "$3"; then
+    tmux send-keys -t "$LOGIN_SESSION" Enter
+  fi
+}
+
+onboarding_done() {
+  [ -f "$ONBOARD_STATE" ] || return 1
+  grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$ONBOARD_STATE"
+}
+
+login_cleanup() {
+  tmux kill-session -t "$LOGIN_SESSION" 2>/dev/null
+  return 0
+}
+
+do_login() {
+  command -v claude >/dev/null 2>&1 || die "claude not found in PATH"
+
+  login_cleanup
+  # A wide pane leaves the URL with fewer wrap points to be rebuilt from. No
+  # --remote-control: this session is here to answer setup, and registering it
+  # would collide with the one the watchdog owns.
+  # shellcheck disable=SC2086 — ARGS is intentionally word-split
+  tmux new-session -d -s "$LOGIN_SESSION" -x 200 -y 50 -c "$HOME" \
+    claude $ARGS || die "could not start the login session"
+
+  echo "Walking Claude Code's first-run setup..." >&2
+
+  code_sent=0
+  waited=0
+
+  while [ "$waited" -lt "$LOGIN_BUDGET" ]; do
+    if onboarding_done; then
+      echo "Setup complete." >&2
+      login_cleanup
+      clear_logged_out
+      # The watchdog backs off hard on a machine it cannot fix, so left alone
+      # it would idle for minutes after the login is repaired. Dropping the
+      # stale session makes the next pass rebuild it immediately.
+      tmux kill-session -t "$SESSION" 2>/dev/null
+      echo "The watchdog will rebuild the session within ${INTERVAL}s." >&2
+      echo "Check it with: $0 status" >&2
+      return 0
+    fi
+
+    if ! tmux has-session -t "$LOGIN_SESSION" 2>/dev/null; then
+      echo "The setup session exited before finishing." >&2
+      [ "$code_sent" -eq 1 ] &&
+        echo "The code may have been rejected — run this again for a fresh URL." >&2
+      return 1
+    fi
+
+    screen=$(login_screen)
+
+    if contains "$screen" "Choose the text style"; then
+      login_pick 1 "theme picker" "Choose the text style"
+      sleep 3
+      continue
+    fi
+
+    if contains "$screen" "Select login method"; then
+      login_pick 1 "login method (Claude subscription)" "Select login method"
+      sleep 5
+      continue
+    fi
+
+    # The one human step. Everything else here exists to reach it cleanly.
+    if [ "$code_sent" -eq 0 ] && contains "$screen" "Paste code here"; then
+      url=$(login_url)
+      if [ -z "$url" ]; then
+        sleep 3
+        waited=$((waited + 3))
+        continue
+      fi
+      echo >&2
+      echo "Open this URL, sign in with your claude.ai Pro/Max account," >&2
+      echo "then paste the code it gives you back here:" >&2
+      echo >&2
+      echo "$url" >&2
+      echo >&2
+      printf 'Code: ' >&2
+      read -r code || code=""
+      [ -n "$code" ] || { login_cleanup; die "no code entered; login abandoned"; }
+
+      # -l sends it literally: the code carries a '#', which tmux would
+      # otherwise read as the start of a format string.
+      tmux send-keys -t "$LOGIN_SESSION" -l "$code"
+      sleep 1
+      tmux send-keys -t "$LOGIN_SESSION" Enter
+      code_sent=1
+      echo "  code sent, waiting for claude to accept it" >&2
+      sleep 8
+      continue
+    fi
+
+    # Two screens in the run are pure acknowledgements — "Login successful" and
+    # the security notes — and both wait on Enter with nothing to choose.
+    if contains "$screen" "Press Enter to continue"; then
+      echo "  acknowledging a notice" >&2
+      tmux send-keys -t "$LOGIN_SESSION" Enter
+      sleep 3
+      continue
+    fi
+
+    if contains "$screen" "trust this folder"; then
+      login_pick 1 "workspace trust prompt" "trust this folder"
+      sleep 3
+      continue
+    fi
+
+    if contains "$screen" "Bypass Permissions mode"; then
+      login_pick 2 "Bypass Permissions warning" "Bypass Permissions mode"
+      sleep 3
+      continue
+    fi
+
+    sleep 3
+    waited=$((waited + 3))
+  done
+
+  login_cleanup
+  echo "Setup did not finish within ${LOGIN_BUDGET}s." >&2
+  return 1
+}
 case "${1:-run}" in
   run)
     failures=0
@@ -342,11 +577,15 @@ case "${1:-run}" in
   stop)
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     ;;
+  login)
+    do_login
+    ;;
   status)
     if ! tmux has-session -t "$SESSION" 2>/dev/null; then
       if [ -f "$LOGOUT_MARK" ]; then
         echo "session '$SESSION': not running — logged out of claude.ai."
-        echo "Run 'claude auth login' with your Pro/Max account to restore it."
+        echo "Run '$0 login' with your Pro/Max account to restore it; it drives"
+        echo "'claude auth login' and relays the code for you."
         exit 1
       fi
       echo "session '$SESSION': not running"
@@ -367,6 +606,6 @@ case "${1:-run}" in
     fi
     ;;
   *)
-    die "unknown command: $1 (expected run, start, stop or status)"
+    die "unknown command: $1 (expected run, start, stop, status or login)"
     ;;
 esac
