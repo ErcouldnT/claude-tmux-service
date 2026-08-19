@@ -18,6 +18,8 @@
 #   claude-remote-start.sh start    create the session once, verified, and exit
 #   claude-remote-start.sh stop     kill the tmux session
 #   claude-remote-start.sh status   report whether the session is registered
+#   claude-remote-start.sh reset    forget the conversation, so the next spawn
+#                                   starts an empty one
 #   claude-remote-start.sh login    sign in to claude.ai: prints the URL and
 #                                   relays the code you paste back
 #
@@ -32,6 +34,8 @@
 #   CLAUDE_TMUX_AUTO_TRUST   answer claude's first-run gates (default: 1)
 #   CLAUDE_TMUX_MAX_BACKOFF  cap on the retry delay    (default: 300 seconds)
 #   CLAUDE_TMUX_LOGIN_WAIT   budget for the `login` walkthrough (default: 600s)
+#   CLAUDE_TMUX_RESUME       resume the same conversation across restarts
+#                            (default: 1, 0 starts every session empty)
 set -u
 
 # Cover the common install locations across distros and macOS:
@@ -52,6 +56,7 @@ READY="${CLAUDE_TMUX_READY:-remote-control is active}"
 AUTO_TRUST="${CLAUDE_TMUX_AUTO_TRUST:-1}"
 MAX_BACKOFF="${CLAUDE_TMUX_MAX_BACKOFF:-300}"
 NOTIFY="${CLAUDE_TMUX_NOTIFY:-1}"
+RESUME="${CLAUDE_TMUX_RESUME:-1}"
 
 # How often to re-read the pane while verifying a fresh spawn.
 VERIFY_STEP=5
@@ -63,6 +68,20 @@ VERIFY_STEP=5
 # says why it stopped and how to revive it.
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-tmux"
 LOGOUT_MARK="$STATE_DIR/logged-out"
+
+# Every restart the watchdog performs — a crash, a network timeout, a reboot —
+# otherwise costs the conversation: claude starts empty and whatever was being
+# worked on from the phone is gone. So the session is pinned to one conversation
+# id, kept here, and every respawn reattaches to it. Recorded rather than
+# derived: `claude --continue` would take the most recent conversation in $HOME,
+# which is just as likely to be one the person started by hand in a terminal.
+SESSION_ID_FILE="$STATE_DIR/session-id"
+# Consecutive spawns that failed while resuming. A transcript claude refuses to
+# open would otherwise be retried forever; see resume_failed.
+RESUME_FAIL_FILE="$STATE_DIR/resume-failures"
+RESUME_FAIL_LIMIT=3
+# Where claude keeps its transcripts, one directory per working directory.
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # A stuck setup — logged out, no network, a renamed banner — fails identically
 # on every retry, and each retry emits the same handful of lines. Left alone
@@ -133,6 +152,131 @@ mark_logged_out() {
 }
 clear_logged_out() {
   rm -f "$LOGOUT_MARK" 2>/dev/null
+  return 0
+}
+
+# --- conversation continuity ------------------------------------------------
+
+# uuidgen ships with macOS and with util-linux; /proc is the Linux fallback for
+# the minimal images that carry neither.
+new_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'ABCDEF' 'abcdef'
+  elif [ -r /proc/sys/kernel/random/uuid ]; then
+    _u=""
+    read -r _u < /proc/sys/kernel/random/uuid 2>/dev/null
+    [ -n "$_u" ] && echo "$_u"
+  else
+    return 1
+  fi
+}
+
+# The id reaches a command line unquoted, and it is read back from a file that
+# anything could have written, so shape it before trusting it: 8-4-4-4-12 hex.
+valid_uuid() {
+  case "$1" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      return 0 ;;
+  esac
+  return 1
+}
+
+# read returns non-zero on a file with no trailing newline while still setting
+# the variable, so judge the value rather than the exit status — a hand-written
+# id file would otherwise look empty.
+saved_session_id() {
+  [ -f "$SESSION_ID_FILE" ] || return 1
+  _id=""
+  read -r _id < "$SESSION_ID_FILE" 2>/dev/null
+  valid_uuid "${_id:-}" || return 1
+  echo "$_id"
+}
+
+save_session_id() {
+  mkdir -p "$STATE_DIR" 2>/dev/null && echo "$1" > "$SESSION_ID_FILE" 2>/dev/null
+  return 0
+}
+
+forget_session_id() {
+  rm -f "$SESSION_ID_FILE" "$RESUME_FAIL_FILE" 2>/dev/null
+  return 0
+}
+
+# --resume only works on a transcript that exists. Checking first turns the
+# common case — the id was recorded but claude never got far enough to write
+# anything — into a clean fresh start instead of a spawn that exits instantly.
+# The glob covers every project directory rather than reproducing claude's
+# rule for encoding a path into a directory name.
+transcript_exists() {
+  for _t in "$CLAUDE_DIR"/projects/*/"$1.jsonl"; do
+    [ -f "$_t" ] && return 0
+  done
+  return 1
+}
+
+# Work out the flags that put the next spawn back into the pinned conversation.
+# Assigns two globals rather than printing them: RESUMING has to reach the
+# caller so a failure can be judged, and a command substitution would strand it
+# in a subshell.
+RESUMING=0
+RESUME_ARGS=""
+set_resume_args() {
+  RESUMING=0
+  RESUME_ARGS=""
+  [ "$RESUME" = 0 ] && return 0
+
+  _id=$(saved_session_id) || _id=""
+  if [ -n "$_id" ] && transcript_exists "$_id"; then
+    RESUMING=1
+    RESUME_ARGS="--resume $_id"
+    return 0
+  fi
+
+  # Nothing to resume yet. Naming the id up front — rather than letting claude
+  # pick one and reading it back — is what makes the *next* restart able to
+  # find this conversation.
+  _id=$(new_uuid) && valid_uuid "$_id" || {
+    log "cannot generate a session id; this conversation will not survive a restart"
+    return 0
+  }
+  save_session_id "$_id"
+  RESUME_ARGS="--session-id $_id"
+}
+
+# A spawn failed while resuming. Most causes are unrelated to the transcript —
+# no network, a logout — and forgetting the conversation over one of those would
+# throw away exactly what this feature exists to keep. So count instead, and
+# only give up on the transcript once it has failed $RESUME_FAIL_LIMIT times in
+# a row; a caller that knows claude rejected the transcript passes `now`.
+resume_failed() {
+  [ "$RESUMING" -eq 1 ] || return 0
+  if [ "${1:-}" = now ]; then
+    log "claude could not reopen the previous conversation; starting a new one"
+    forget_session_id
+    # There is no longer a conversation to blame, and ensure_session still has
+    # its own failing spawn to report: without this the second call would
+    # re-create the counter this one just cleared, and the *next* conversation
+    # would inherit a failure it never had.
+    RESUMING=0
+    return 0
+  fi
+  _n=0
+  [ -f "$RESUME_FAIL_FILE" ] && read -r _n < "$RESUME_FAIL_FILE"
+  case "${_n:-}" in
+    ''|*[!0-9]*) _n=0 ;;
+  esac
+  _n=$((_n + 1))
+  if [ "$_n" -ge "$RESUME_FAIL_LIMIT" ]; then
+    log "the previous conversation has failed to start $_n times; starting a new one"
+    forget_session_id
+    return 0
+  fi
+  mkdir -p "$STATE_DIR" 2>/dev/null && echo "$_n" > "$RESUME_FAIL_FILE" 2>/dev/null
+  return 0
+}
+
+resume_succeeded() {
+  rm -f "$RESUME_FAIL_FILE" 2>/dev/null
   return 0
 }
 
@@ -267,6 +411,20 @@ verify_session() {
       return 0
     fi
 
+    # claude rejecting the transcript is the one failure that repeating cannot
+    # fix, and it is worth telling apart from a spawn that failed for its own
+    # reasons: drop the pinned conversation now rather than after three passes.
+    # Usually it exits too fast to be caught here — the pane goes with it — and
+    # then resume_failed's counter is what ends the loop.
+    if [ "$RESUMING" -eq 1 ] &&
+       { contains "$out" "No conversation found" ||
+         contains "$out" "No session found" ||
+         contains "$out" "Session not found"; }; then
+      resume_failed now
+      tmux kill-session -t "$SESSION" 2>/dev/null
+      return 1
+    fi
+
     if contains "$out" "must be logged in" || contains "$out" "Not logged in"; then
       log "claude reports it is not logged in; Remote Control cannot start."
       log "Run '$0 login' to sign in — it drives 'claude auth login' for you,"
@@ -344,14 +502,21 @@ ensure_session() {
     return 1
   fi
 
-  # shellcheck disable=SC2086 — ARGS is intentionally word-split
+  set_resume_args
+
+  # shellcheck disable=SC2086 — ARGS and RESUME_ARGS are intentionally word-split
   tmux new-session -d -s "$SESSION" -c "$HOME" \
-    claude --remote-control "$SESSION" $ARGS || {
+    claude --remote-control "$SESSION" $RESUME_ARGS $ARGS || {
       log "tmux new-session failed, will retry"
       return 1
     }
 
-  verify_session
+  if verify_session; then
+    resume_succeeded
+    return 0
+  fi
+  resume_failed
+  return 1
 }
 
 # Retry delay: $INTERVAL normally, doubling while the session keeps failing to
@@ -575,7 +740,15 @@ case "${1:-run}" in
     ensure_session
     ;;
   stop)
+    # The conversation id is deliberately left in place: stopping the session
+    # is not the same as abandoning what it was doing, and `start` should pick
+    # the thread back up. `reset` is how you ask for a clean slate.
     tmux kill-session -t "$SESSION" 2>/dev/null || true
+    ;;
+  reset)
+    forget_session_id
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    echo "conversation forgotten; the next session starts empty."
     ;;
   login)
     do_login
@@ -594,6 +767,9 @@ case "${1:-run}" in
     if contains "$(pane_head)" "$READY"; then
       clear_logged_out
       echo "session '$SESSION': running, registered with Remote Control"
+      if [ "$RESUME" != 0 ] && id=$(saved_session_id); then
+        echo "conversation $id — kept across restarts"
+      fi
     elif history_trimmed; then
       # Exit 2, not 0 or 1: nothing is known to be wrong, but nothing is
       # confirmed either, and a caller should be able to tell those apart.
@@ -606,6 +782,6 @@ case "${1:-run}" in
     fi
     ;;
   *)
-    die "unknown command: $1 (expected run, start, stop, status or login)"
+    die "unknown command: $1 (expected run, start, stop, reset, status or login)"
     ;;
 esac

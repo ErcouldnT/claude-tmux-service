@@ -28,6 +28,34 @@ service manager  ──▶  watchdog loop  ──▶  tmux session  ──▶  c
 
 Each layer heals the one below it: service manager → watchdog → tmux → claude.
 
+### The conversation survives the restart
+
+A watchdog that only keeps a session *alive* still loses the work: every
+respawn used to open an empty claude, so a crash or a network timeout wiped
+whatever was being worked on from the phone.
+
+So the session is pinned to one conversation. The first spawn names it —
+`claude --session-id <uuid>` — and records the id under the watchdog's state
+dir; every later spawn reattaches with `claude --resume <uuid>`. Reconnect from
+the app after a reboot and the history is still there.
+
+The id is recorded rather than derived. `claude --continue` would take the most
+recent conversation in `$HOME`, which is just as likely to be one you started by
+hand in a terminal — the remote session would then wander into it.
+
+Two escape hatches, because a pinned conversation is a thing that can go wrong:
+
+- A transcript claude refuses to open would otherwise wedge the service for
+  good. If it says so outright the conversation is dropped at once; otherwise
+  three failed spawns in a row is enough, since most failures (no network, a
+  logout) have nothing to do with the transcript and one of those must not cost
+  you the history. Either way the next spawn starts a fresh conversation.
+- `claude-remote-start.sh reset` forgets it deliberately, for when you just want
+  a clean slate. `stop` does **not** — stopping the session isn't the same as
+  abandoning what it was doing.
+
+Set `CLAUDE_TMUX_RESUME=0` to go back to an empty session every time.
+
 ### Why "is the session alive?" isn't enough
 
 If `claude` starts a few seconds before the network is up, registering with
@@ -291,6 +319,10 @@ CLAUDE_TMUX_AUTO_TRUST=1
 # raise a desktop notification when a logout is detected — the one failure the
 # watchdog cannot fix on its own; 0 to stay silent and rely on the log
 CLAUDE_TMUX_NOTIFY=1
+
+# reattach every restart to the same conversation, so a crash or a reboot does
+# not throw away what the session was doing; 0 to start empty every time
+CLAUDE_TMUX_RESUME=1
 ```
 
 Re-run `./install.sh` (or restart the service) after editing.
@@ -332,10 +364,20 @@ tail -f ~/Library/Logs/claude-tmux.log
 ```sh
 ~/.local/bin/claude-remote-start.sh status
 # session 'pi5': running, registered with Remote Control
+# conversation 6f1c…-…-…  — kept across restarts
 ```
 The one check that distinguishes "a session exists" from "my phone can see it".
 Exit codes: `0` registered, `1` missing or running-but-not-registered, `2`
-running but unconfirmable.
+running but unconfirmable. The second line names the pinned conversation, the
+one every restart reattaches to.
+
+**Start over with an empty conversation:**
+```sh
+~/.local/bin/claude-remote-start.sh reset
+```
+Forgets the pinned conversation and drops the session; the watchdog rebuilds it
+empty within one interval. Use `stop` when you want the session gone but the
+thread kept.
 
 That third state is real rather than a hedge. The evidence is the startup
 banner, which lives at the top of the pane's history, and `status` reads only
@@ -479,6 +521,19 @@ session.
   shows a healthy, connected claude.** The verification banner no longer
   matches. Check what the pane actually prints and set `CLAUDE_TMUX_READY` to a
   substring of it — or set `CLAUDE_TMUX_VERIFY=0` to turn verification off.
+- **The session comes back empty after a restart.** Check `status` for the
+  `conversation …` line. No line means nothing is pinned — either
+  `CLAUDE_TMUX_RESUME=0`, or the conversation was dropped because it kept
+  failing to start (the log says `starting a new one`). Note the pin is per
+  machine and lives in the watchdog's state dir, so a `--yes` uninstall clears
+  it along with everything else the service put there.
+- **A resumed session replays its transcript into the pane.** Harmless in
+  itself, but it shares the scrollback with the registration check: a
+  conversation that once *discussed* the `remote-control is active` banner puts
+  that phrase back on screen, and `status` can then report a session as
+  registered on the strength of the replay rather than the real banner. If you
+  need the check to be exact, `CLAUDE_TMUX_READY` can be set to something the
+  conversation will not say.
 - **`claude` not found.** The watchdog searches `~/.local/bin`, linuxbrew,
   Homebrew (ARM + Intel), and `/usr/local/bin`. If Claude Code lives elsewhere,
   add its directory to `PATH` in `~/.config/claude-tmux/env`.

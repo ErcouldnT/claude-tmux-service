@@ -39,6 +39,7 @@ new_case() {
   : > "$STATE/screen"
   : > "$STATE/head"
   : > "$STATE/keys"
+  : > "$STATE/cmd"
   echo 10   > "$STATE/hist"
   echo 2000 > "$STATE/limit"
 
@@ -47,7 +48,7 @@ new_case() {
 cmd=$1
 case "$cmd" in
   has-session)  [ -f "$STATE/session" ] ;;
-  new-session)  : > "$STATE/session" ;;
+  new-session)  : > "$STATE/session"; printf '%s\n' "$*" >> "$STATE/cmd" ;;
   kill-session) rm -f "$STATE/session" ;;
   capture-pane)
     # Three shapes, told apart by argument count: -E is pane_head asking for
@@ -122,6 +123,22 @@ run_cmd() {
 
 # Where mark_logged_out drops its marker, given the XDG_STATE_HOME above.
 logout_mark() { echo "$HOME_DIR/.local/state/claude-tmux/logged-out"; }
+
+# The pinned conversation: where its id is recorded, and the transcript claude
+# would have written for it. The directory under projects/ is named after the
+# working directory; the script globs for it, so any name will do here.
+id_file()    { echo "$HOME_DIR/.local/state/claude-tmux/session-id"; }
+saved_id()   { cat "$(id_file)" 2>/dev/null; }
+pin_id() {
+  mkdir -p "$(dirname "$(id_file)")"
+  echo "$1" > "$(id_file)"
+}
+write_transcript() {
+  mkdir -p "$HOME_DIR/.claude/projects/-home-tester"
+  : > "$HOME_DIR/.claude/projects/-home-tester/$1.jsonl"
+}
+# The flags claude was actually launched with.
+spawn_cmd() { cat "$STATE/cmd" 2>/dev/null; }
 
 # Each writes its screen to the file named by $1, so a case can build up the
 # scrollback the way claude does: a dismissed prompt scrolls up, it does not
@@ -286,6 +303,126 @@ check "logged out marks the state"     '[ -f "$(logout_mark)" ]'
 # the guard only clears once a spawn succeeds (log_reset). A single start goes
 # through verify once, so this asserts the guard holds across that pass.
 check "notifies exactly once"          '[ "$(wc -l < "$STATE/notify")" -eq 1 ]'
+
+echo
+echo "claude-remote-start.sh — conversation continuity"
+
+# --- the first spawn names the conversation, so later ones can find it ------
+# Letting claude pick the id and reading it back afterwards would leave nothing
+# to reattach to; naming it up front is the whole mechanism.
+new_case resume_first
+banner "$STATE/pane"
+run_cmd start
+
+check "first spawn verifies"           '[ "$RC" -eq 0 ]'
+check "first spawn names the session"  'spawn_cmd | grep -q -- "--session-id"'
+check "first spawn does not resume"    '! spawn_cmd | grep -q -- "--resume"'
+check "the id is recorded"             '[ -n "$(saved_id)" ]'
+check "the recorded id was the one used" 'spawn_cmd | grep -q -- "--session-id $(saved_id)"'
+
+# --- a restart reattaches to that same conversation -------------------------
+new_case resume_again
+banner "$STATE/pane"
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd start
+
+check "restart verifies"             '[ "$RC" -eq 0 ]'
+check "restart resumes the pinned id" 'spawn_cmd | grep -q -- "--resume 11111111-2222-3333-4444-555555555555"'
+check "restart names no new session"  '! spawn_cmd | grep -q -- "--session-id"'
+check "the id survives the restart"   '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+
+# --- an id with no transcript behind it is not worth resuming ---------------
+# claude would exit instantly on --resume; this is the state left behind when a
+# first spawn recorded an id but never got far enough to write anything.
+new_case resume_no_transcript
+banner "$STATE/pane"
+pin_id 11111111-2222-3333-4444-555555555555
+run_cmd start
+
+check "a transcript-less id is dropped" '! spawn_cmd | grep -q -- "--resume"'
+check "a fresh conversation is named"   'spawn_cmd | grep -q -- "--session-id"'
+check "the recorded id is replaced"     '[ "$(saved_id)" != 11111111-2222-3333-4444-555555555555 ]'
+
+# --- a junk id file is ignored rather than spliced onto the command line ----
+new_case resume_junk_id
+banner "$STATE/pane"
+pin_id "; rm -rf /"
+run_cmd start
+
+check "junk is not passed to claude" '! spawn_cmd | grep -q "rm -rf"'
+check "junk is replaced by a real id" 'spawn_cmd | grep -q -- "--session-id"'
+
+# --- opting out starts every session empty ----------------------------------
+new_case resume_off
+banner "$STATE/pane"
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd start env CLAUDE_TMUX_RESUME=0
+
+check "opting out does not resume"    '! spawn_cmd | grep -q -- "--resume"'
+check "opting out pins nothing"       '! spawn_cmd | grep -q -- "--session-id"'
+
+# --- a conversation that keeps failing to start is eventually abandoned -----
+# Most spawn failures have nothing to do with the transcript — no network, a
+# logout — so one is not enough to throw the conversation away. Three in a row
+# is, otherwise a transcript claude refuses to open wedges the service forever.
+new_case resume_gives_up
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd start                                   # never ready: verification fails
+check "one failure keeps the conversation"  '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+run_cmd start
+check "two failures keep it too"            '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+run_cmd start
+check "the third gives up on it"            '[ -z "$(saved_id)" ]'
+check "and says so"                         'grep -q "starting a new one" "$OUT"'
+
+# --- claude rejecting the transcript is not worth three passes --------------
+new_case resume_rejected
+printf 'No conversation found with session ID\n' > "$STATE/pane"
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd start
+
+check "a rejected transcript fails the spawn" '[ "$RC" -ne 0 ]'
+check "and is dropped immediately"            '[ -z "$(saved_id)" ]'
+check "and recycles the session"              '[ ! -f "$STATE/session" ]'
+# Dropping the conversation ends the matter: the same spawn's failure must not
+# also be charged to the counter, or the next conversation starts one down.
+check "and leaves no failure charged"         '[ ! -f "$HOME_DIR/.local/state/claude-tmux/resume-failures" ]'
+
+# --- a success clears the failure count -------------------------------------
+# Without this, three failures spread over a week would abandon a conversation
+# that has been working fine in between.
+new_case resume_fail_count_clears
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd start                       # fails: no banner
+banner "$STATE/pane"
+run_cmd start                       # succeeds, clearing the count
+: > "$STATE/pane"
+run_cmd start                       # fails again — but as the first, not the second
+banner "$STATE/pane"
+run_cmd start
+
+check "a working conversation is kept" '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+
+# --- stop keeps the thread, reset drops it ----------------------------------
+new_case resume_stop_vs_reset
+pin_id 11111111-2222-3333-4444-555555555555
+: > "$STATE/session"
+run_cmd stop
+
+check "stop leaves the session dead"  '[ ! -f "$STATE/session" ]'
+check "stop keeps the conversation"   '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+
+: > "$STATE/session"
+run_cmd reset
+
+check "reset kills the session"       '[ ! -f "$STATE/session" ]'
+check "reset forgets the conversation" '[ -z "$(saved_id)" ]'
+check "reset says what it did"        'grep -q "starts empty" "$OUT"'
 
 echo
 echo "claude-remote-start.sh — status"
