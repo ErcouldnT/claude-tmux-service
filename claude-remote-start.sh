@@ -36,6 +36,13 @@
 #   CLAUDE_TMUX_LOGIN_WAIT   budget for the `login` walkthrough (default: 600s)
 #   CLAUDE_TMUX_RESUME       resume the same conversation across restarts
 #                            (default: 1, 0 starts every session empty)
+#   CLAUDE_TMUX_RC_OK        status-bar text meaning "registered" (default: /rc)
+#   CLAUDE_TMUX_RC_FAILED    status-bar text meaning "registration failed"
+#                            (default: /rc failed)
+#   CLAUDE_TMUX_HEALTH       re-check an already-running session this often
+#                            (default: 300 seconds, 0 disables)
+#   CLAUDE_TMUX_HEALTH_STRIKES  consecutive failed checks before recycling
+#                            (default: 2)
 set -u
 
 # Cover the common install locations across distros and macOS:
@@ -57,6 +64,10 @@ AUTO_TRUST="${CLAUDE_TMUX_AUTO_TRUST:-1}"
 MAX_BACKOFF="${CLAUDE_TMUX_MAX_BACKOFF:-300}"
 NOTIFY="${CLAUDE_TMUX_NOTIFY:-1}"
 RESUME="${CLAUDE_TMUX_RESUME:-1}"
+RC_OK="${CLAUDE_TMUX_RC_OK:-/rc}"
+RC_FAILED="${CLAUDE_TMUX_RC_FAILED:-/rc failed}"
+HEALTH="${CLAUDE_TMUX_HEALTH:-300}"
+HEALTH_STRIKES="${CLAUDE_TMUX_HEALTH_STRIKES:-2}"
 
 # How often to re-read the pane while verifying a fresh spawn.
 VERIFY_STEP=5
@@ -340,6 +351,54 @@ contains() {
   return 1
 }
 
+# How many trailing lines of the visible screen count as the status bar.
+STATUS_LINES=3
+
+# Claude Code's status bar is the bottom-most chrome in the pane, and it is
+# repainted every frame. That makes it the one part of the pane that always
+# describes the session as it is *now*: scrollback is history, and with
+# --resume the scrollback is somebody else's history entirely.
+pane_status() {
+  pane_screen | grep -v '^[[:space:]]*$' | tail -n "$STATUS_LINES"
+}
+
+# Is this session registered with Remote Control right now? Echoes one of
+# active / failed / unknown.
+#
+# Evidence, strongest first:
+#
+#   1. The status bar. "/rc" means registered, "/rc failed" means it is not.
+#      Checked first, and checked for failure first, because "/rc failed"
+#      contains "/rc".
+#   2. The opening output, where a fresh spawn prints its banner.
+#
+# The scrollback is deliberately not evidence, in either direction. Resuming a
+# conversation replays its transcript into the pane, so a session that has ever
+# discussed its own registration carries both the "remote-control is active"
+# banner *and* a "Remote Control disconnected" line in its history, neither of
+# which says anything about the present. Trusting the scrollback is what let a
+# session sit unregistered for hours while the watchdog read a replayed banner
+# and called it healthy.
+#
+# Absence of evidence stays "unknown" rather than "failed": callers must not
+# recycle a working session just because Claude Code renamed its chrome.
+registration_state() {
+  _bar=$(pane_status)
+  if contains "$_bar" "$RC_FAILED"; then
+    echo failed
+    return 0
+  fi
+  if contains "$_bar" "$RC_OK"; then
+    echo active
+    return 0
+  fi
+  if contains "$(pane_head)" "$READY"; then
+    echo active
+    return 0
+  fi
+  echo unknown
+}
+
 # A systemd *user* unit cannot order itself after the network:
 # network-online.target does not exist in the user manager, so the unit's
 # After=/Wants= lines are silently no-ops. Asking NetworkManager over D-Bus is
@@ -392,6 +451,11 @@ verify_session() {
   theme_answered=0
   trust_answered=0
   bypass_answered=0
+  # Remote Control can take a moment to come up, and the status bar says
+  # "/rc failed" until it does. So a single failed reading is not conclusive
+  # here — it is only worth reporting if the whole budget runs out with the
+  # session still in that state.
+  rc_failed_seen=0
   while [ "$waited" -lt "$VERIFY" ]; do
     sleep "$VERIFY_STEP"
     waited=$((waited + VERIFY_STEP))
@@ -406,10 +470,13 @@ verify_session() {
     fi
 
     out=$(pane_text)
-    if contains "$out" "$READY"; then
-      clear_logged_out
-      return 0
-    fi
+    case "$(registration_state)" in
+      active)
+        clear_logged_out
+        return 0 ;;
+      failed)
+        rc_failed_seen=1 ;;
+    esac
 
     # claude rejecting the transcript is the one failure that repeating cannot
     # fix, and it is worth telling apart from a spawn that failed for its own
@@ -483,14 +550,75 @@ verify_session() {
     fi
   done
 
-  log "session '$SESSION' started but never showed '$READY' within ${VERIFY}s;"
-  log "recycling it. If Claude Code renamed that banner, set CLAUDE_TMUX_READY."
+  if [ "$rc_failed_seen" -eq 1 ]; then
+    # The overwhelmingly common cause: the stored claude.ai token expired while
+    # the machine was off or the service was down, so claude starts, runs
+    # perfectly well as a local session, and simply never registers. Starting
+    # claude again is what refreshes the token, so recycling is the fix — no
+    # login needed, which is why this is not treated as a logout.
+    log "session '$SESSION' is running but Remote Control registration failed;"
+    log "recycling it. Usually an expired claude.ai token — a fresh start"
+    log "refreshes it. If it keeps failing, run '$0 login'."
+  else
+    log "session '$SESSION' started but never showed '$READY' within ${VERIFY}s;"
+    log "recycling it. If Claude Code renamed that banner, set CLAUDE_TMUX_READY."
+  fi
+  tmux kill-session -t "$SESSION" 2>/dev/null
+  return 1
+}
+
+# Spawn verification only ever looks at a session on its way up. That leaves
+# the failure this service exists to prevent wide open: a session that came up
+# registered, lost the registration later — the token behind it expires every
+# few hours — and kept running as an ordinary local session. tmux still has a
+# session, so a watchdog that only asks "does the session exist?" is satisfied
+# forever, and the machine quietly stops answering from the Claude app.
+#
+# So re-check a session that is already up, every $HEALTH seconds. Recycling it
+# is the repair: starting claude again refreshes the token.
+#
+# Two things keep this from fighting a working session. Only an explicit
+# "failed" from the status bar counts — "unknown" is left alone. And it has to
+# say so $HEALTH_STRIKES checks running, so a reconnect that is merely in
+# progress is given time to finish.
+# Zero, not "now", so the first pass over an already-running session checks it
+# rather than trusting it for $HEALTH seconds. That is the case where trust is
+# least earned: the watchdog has just started and has verified nothing.
+HEALTH_LAST=0
+HEALTH_SEEN=0
+session_healthy() {
+  [ "$HEALTH" -gt 0 ] || return 0
+
+  _now=$(date +%s 2>/dev/null) || return 0
+  [ $((_now - HEALTH_LAST)) -ge "$HEALTH" ] || return 0
+  HEALTH_LAST=$_now
+
+  if [ "$(registration_state)" != failed ]; then
+    HEALTH_SEEN=0
+    return 0
+  fi
+
+  HEALTH_SEEN=$((HEALTH_SEEN + 1))
+  if [ "$HEALTH_SEEN" -lt "$HEALTH_STRIKES" ]; then
+    log "session '$SESSION' reports a failed Remote Control registration;"
+    log "re-checking in ${HEALTH}s before recycling it."
+    return 0
+  fi
+
+  log "session '$SESSION' has been unregistered for $HEALTH_SEEN checks;"
+  log "recycling it. Usually an expired claude.ai token — a fresh start"
+  log "refreshes it."
+  notify_once "Remote Control registration dropped — restarting the Claude session."
+  HEALTH_SEEN=0
   tmux kill-session -t "$SESSION" 2>/dev/null
   return 1
 }
 
 ensure_session() {
   if tmux has-session -t "$SESSION" 2>/dev/null; then
+    # Recycled: report the failure so the caller waits before respawning,
+    # rather than racing the session it just killed.
+    session_healthy || return 1
     return 0
   fi
   if ! command -v claude >/dev/null 2>&1; then
@@ -764,12 +892,18 @@ case "${1:-run}" in
       echo "session '$SESSION': not running"
       exit 1
     fi
-    if contains "$(pane_head)" "$READY"; then
+    state=$(registration_state)
+    if [ "$state" = active ]; then
       clear_logged_out
       echo "session '$SESSION': running, registered with Remote Control"
       if [ "$RESUME" != 0 ] && id=$(saved_session_id); then
         echo "conversation $id — kept across restarts"
       fi
+    elif [ "$state" = failed ]; then
+      echo "session '$SESSION': running, but Remote Control registration FAILED."
+      echo "Usually an expired claude.ai token. The watchdog recycles the session"
+      echo "on its own; '$0 stop' then 'start' does it now."
+      exit 1
     elif history_trimmed; then
       # Exit 2, not 0 or 1: nothing is known to be wrong, but nothing is
       # confirmed either, and a caller should be able to tell those apart.

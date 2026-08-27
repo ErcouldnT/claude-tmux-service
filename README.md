@@ -77,6 +77,39 @@ Two things prevent it:
 Where `nm-online` isn't available (macOS, non-NetworkManager systems) step 1 is
 skipped and step 2 does the work on its own.
 
+### Registration is checked for as long as the session runs
+
+Verifying a session on its way up says nothing about it an hour later, and the
+same failure can arrive at any time: the claude.ai token behind Remote Control
+expires every few hours, and a session whose token lapses keeps running as an
+ordinary local session — registered with nothing. tmux still has a session, so
+a watchdog that only asks *does the session exist?* stays satisfied while the
+machine quietly stops answering from the Claude app.
+
+So an already-running session is re-checked every `CLAUDE_TMUX_HEALTH` seconds.
+If it reports a failed registration `CLAUDE_TMUX_HEALTH_STRIKES` checks running,
+it is recycled — and recycling *is* the repair, because starting `claude` again
+refreshes the token. No login is involved, which is why this isn't treated as a
+logout.
+
+### What counts as proof of registration
+
+Claude Code prints the `remote-control is active` banner once, at startup, and
+paints a status bar at the bottom of the pane — `/rc` when registered,
+`/rc failed` when not. The status bar is the better witness: it is repainted
+every frame, so it describes the session *now*.
+
+The scrollback is not evidence, in either direction. `CLAUDE_TMUX_RESUME=1`
+replays the previous conversation into the pane on every restart, so a session
+that has ever discussed its own registration carries both the banner and a
+`Remote Control disconnected` line in its history — neither of which says
+anything about the present. So the checks read the status bar first and fall
+back to the *opening* output; a phrase anywhere else is ignored.
+
+When neither is conclusive the state is *unknown*, and an unknown session is
+left alone. Killing a working session because a future release renamed its
+chrome would be worse than the problem being solved.
+
 Repeated failures back off — the retry delay doubles up to
 `CLAUDE_TMUX_MAX_BACKOFF` — so a genuinely broken setup (logged out, banner
 renamed) costs one attempt every few minutes instead of spinning at full rate
@@ -308,6 +341,19 @@ CLAUDE_TMUX_NET_WAIT=55
 # override only if a future Claude Code release renames it
 CLAUDE_TMUX_READY=remote-control is active
 
+# the status bar text that means "registered" / "registration failed"
+# override only if a future Claude Code release renames them
+CLAUDE_TMUX_RC_OK=/rc
+CLAUDE_TMUX_RC_FAILED=/rc failed
+
+# how often to re-check a session that is already running, seconds
+# (0 disables the check and restores the old spawn-time-only behaviour)
+CLAUDE_TMUX_HEALTH=300
+
+# consecutive failed checks before the session is recycled — more than one, so
+# a reconnect that is merely in progress is given time to finish
+CLAUDE_TMUX_HEALTH_STRIKES=2
+
 # ceiling for the retry delay after repeated failures, seconds
 CLAUDE_TMUX_MAX_BACKOFF=300
 
@@ -517,10 +563,23 @@ session.
   disable it first so the two don't fight —
   `systemctl --user disable --now claude-remote.service` and remove its unit
   file — then run `./install.sh`.
+- **The machine stops answering from the Claude app, but the service is
+  `active (running)` and `tmux attach` shows claude alive.** Look at the bottom
+  of the pane: `/rc failed`, usually with a `Remote Control disconnected —
+  /login` line above it. The claude.ai token expired — commonly because the
+  session was started *after* it lapsed, or ran past its few-hour lifetime — so
+  claude carried on as an ordinary local session that is registered with
+  nothing. The health check now catches this and recycles the session, which
+  refreshes the token; `claude-remote-start.sh stop && claude-remote-start.sh
+  start` does it immediately. This needs no login, so `status` reports a failed
+  registration rather than a logout.
 - **The session is killed and recreated every few minutes, but `tmux attach`
-  shows a healthy, connected claude.** The verification banner no longer
-  matches. Check what the pane actually prints and set `CLAUDE_TMUX_READY` to a
-  substring of it — or set `CLAUDE_TMUX_VERIFY=0` to turn verification off.
+  shows a healthy, connected claude.** The verification markers no longer
+  match. Check what the pane's status bar actually prints and set
+  `CLAUDE_TMUX_RC_OK` / `CLAUDE_TMUX_RC_FAILED` (or `CLAUDE_TMUX_READY` for the
+  startup banner) to a substring of it — or set `CLAUDE_TMUX_HEALTH=0` to stop
+  re-checking a running session and `CLAUDE_TMUX_VERIFY=0` to turn spawn
+  verification off.
 - **The session comes back empty after a restart.** Check `status` for the
   `conversation …` line. No line means nothing is pinned — either
   `CLAUDE_TMUX_RESUME=0`, or the conversation was dropped because it kept

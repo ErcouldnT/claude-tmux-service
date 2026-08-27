@@ -184,8 +184,21 @@ Select login method:
 PANE
 }
 
+# The status bar claude paints at the bottom of the pane. This, not the
+# banner, is what the script reads to decide whether the session is registered
+# right now — so a case that wants a healthy session has to render it.
+status_bar() {
+  printf '%s\n' "  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to cycle)             /rc" >> "$1"
+}
+
+# The same bar, as it reads when Remote Control could not register.
+status_bar_failed() {
+  printf '%s\n' "  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to cycle)      /rc failed" >> "$1"
+}
+
 banner() {
   echo "remote-control is active" >> "$1"
+  status_bar "$1"
 }
 
 echo "claude-remote-start.sh — spawn verification"
@@ -476,6 +489,108 @@ run_cmd status
 check "logged-out status exits 1"    '[ "$RC" -eq 1 ]'
 check "names the logout"             'grep -q "logged out" "$OUT"'
 check "points at the login command"  'grep -q "claude auth login" "$OUT"'
+
+# --- a replayed transcript is not evidence of anything ----------------------
+# The bug this guards: --resume replays the previous conversation into the
+# pane, and a conversation that ever discussed Remote Control contains the
+# banner verbatim. Reading the scrollback then "verifies" a session whose own
+# status bar says the registration failed.
+new_case verify_replayed_banner
+echo 500 > "$STATE/hist"
+{
+  echo "so the pane will contain remote-control is active from the replay"
+  echo "and a Remote Control disconnected line further down"
+} > "$STATE/pane"
+printf 'the tail of that replay\n' > "$STATE/screen"
+status_bar_failed "$STATE/screen"
+run_cmd start
+
+check "a replayed banner does not verify"  '[ "$RC" -ne 0 ]'
+check "the session is recycled"            '[ ! -f "$STATE/session" ]'
+check "the log names the real cause"       'grep -q "registration failed" "$OUT"'
+check "and points at the token"            'grep -q "expired claude.ai token" "$OUT"'
+
+# --- the status bar outranks a missing banner -------------------------------
+# The mirror-image bug: on a resumed session the replay pushes the real banner
+# out of the opening output, so checking only there reports a healthy session
+# as unregistered.
+new_case status_bar_registered
+: > "$STATE/session"
+echo 500 > "$STATE/hist"
+printf 'replayed transcript, no banner in the opening output\n' > "$STATE/head"
+printf 'some conversation\n' > "$STATE/screen"
+status_bar "$STATE/screen"
+run_cmd status
+
+check "a live status bar registers"  '[ "$RC" -eq 0 ]'
+check "reports registered"           'grep -q "running, registered" "$OUT"'
+
+new_case status_bar_failed
+: > "$STATE/session"
+echo 500 > "$STATE/hist"
+printf 'remote-control is active\n' > "$STATE/head"   # stale: it did register once
+printf 'some conversation\n' > "$STATE/screen"
+status_bar_failed "$STATE/screen"
+run_cmd status
+
+check "a failed status bar outranks a stale banner" '[ "$RC" -eq 1 ]'
+check "status names the failed registration"        'grep -q "registration FAILED" "$OUT"'
+
+echo
+echo "claude-remote-start.sh — health checks on a running session"
+
+# --- a session that lost its registration is recycled -----------------------
+new_case health_recycles
+: > "$STATE/session"
+printf 'a long conversation\n' > "$STATE/screen"
+status_bar_failed "$STATE/screen"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
+
+check "an unregistered session is recycled" '[ ! -f "$STATE/session" ]'
+check "and the pass reports failure"        '[ "$RC" -ne 0 ]'
+check "the log says why"                    'grep -q "unregistered" "$OUT"'
+
+# --- one bad reading is not enough ------------------------------------------
+# A reconnect in progress reads as failed too, so the default is to look twice.
+new_case health_strikes
+: > "$STATE/session"
+printf 'a long conversation\n' > "$STATE/screen"
+status_bar_failed "$STATE/screen"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=2
+
+check "one failed check does not recycle" '[ -f "$STATE/session" ]'
+check "the pass still succeeds"           '[ "$RC" -eq 0 ]'
+check "but it is announced"               'grep -q "re-checking" "$OUT"'
+
+# --- a healthy session is left alone -----------------------------------------
+new_case health_leaves_healthy
+: > "$STATE/session"
+printf 'a long conversation\n' > "$STATE/screen"
+status_bar "$STATE/screen"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
+
+check "a registered session survives" '[ -f "$STATE/session" ]'
+check "and nothing is logged"         '[ ! -s "$OUT" ]'
+
+# --- an unreadable state is not a failure ------------------------------------
+# No status bar and no banner means the script cannot tell, and killing a
+# working session over that is worse than leaving it be.
+new_case health_unknown_left_alone
+: > "$STATE/session"
+printf 'no chrome this version renders differently\n' > "$STATE/screen"
+printf 'nothing conclusive here either\n' > "$STATE/head"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
+
+check "an unknown state survives" '[ -f "$STATE/session" ]'
+
+# --- health checks can be switched off ---------------------------------------
+new_case health_disabled
+: > "$STATE/session"
+printf 'a long conversation\n' > "$STATE/screen"
+status_bar_failed "$STATE/screen"
+run_cmd start env CLAUDE_TMUX_HEALTH=0
+
+check "CLAUDE_TMUX_HEALTH=0 disables recycling" '[ -f "$STATE/session" ]'
 
 rm -rf "$ROOT"
 echo
