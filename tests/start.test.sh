@@ -184,6 +184,22 @@ Select login method:
 PANE
 }
 
+# Not a first-run prompt: claude raises this one when the conversation being
+# resumed has grown large, so a long-lived pinned session meets it repeatedly.
+# Note what it does to the bottom of the screen — it covers the status bar the
+# registration check reads.
+resume_prompt() {
+  cat >> "$1" <<'PANE'
+This session is 1d 5h old and 210.6k tokens.
+Resuming the full session will consume a substantial portion of your usage
+limits. We recommend resuming from a summary.
+> 1. Resume from summary (recommended)
+  2. Resume full session as-is
+  3. Don't ask me again
+Enter to confirm · Esc to cancel
+PANE
+}
+
 # The status bar claude paints at the bottom of the pane. This, not the
 # banner, is what the script reads to decide whether the session is registered
 # right now — so a case that wants a healthy session has to render it.
@@ -230,6 +246,19 @@ check "session left running"             '[ -f "$STATE/session" ]'
 check "picks 'Yes, I accept', not 'No'"  '[ "$(head -n1 "$STATE/keys")" = 2 ]'
 check "never sends the exit entry"       '! grep -qx 1 "$STATE/keys"'
 check "says what it did"                 'grep -q "answering the Bypass Permissions warning" "$OUT"'
+
+# --- the resume chooser is answered, and the session comes up ---------------
+new_case resume_gate
+resume_prompt "$STATE/screen"
+# Picking an entry advances straight past it: claude's menus act on the digit.
+banner "$STATE/step1"; banner "$STATE/screen1"
+run_cmd start
+
+check "the resume prompt verifies"      '[ "$RC" -eq 0 ]'
+check "session left running"            '[ -f "$STATE/session" ]'
+check "picks 'Resume from summary'"     '[ "$(head -n1 "$STATE/keys")" = 1 ]'
+check "no stray Enter once it advances" '! grep -qx Enter "$STATE/keys"'
+check "says what it did"                'grep -q "answering the resume prompt" "$OUT"'
 
 # --- the sign-in screen needs a person, so the watchdog must not sit on it --
 new_case signin
@@ -572,9 +601,37 @@ run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
 check "a registered session survives" '[ -f "$STATE/session" ]'
 check "and nothing is logged"         '[ ! -s "$OUT" ]'
 
+# --- the resume chooser can appear on a session that has been up for days ----
+# The reconnect after a dropped registration resumes the pinned conversation,
+# and a large one is met with the chooser. Answering it costs nothing; letting
+# it sit costs the machine, because it covers the bar the check reads.
+new_case health_answers_resume_gate
+: > "$STATE/session"
+resume_prompt "$STATE/screen"
+banner "$STATE/step1"; banner "$STATE/screen1"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
+
+check "the gate is answered, not recycled" '[ -f "$STATE/session" ]'
+check "picks 'Resume from summary'"        '[ "$(head -n1 "$STATE/keys")" = 1 ]'
+check "and the pass succeeds"              '[ "$RC" -eq 0 ]'
+
+# --- the chooser is read off the screen, never the scrollback ----------------
+# This session is itself a claude that can be asked about its own resume
+# prompt, so the phrase turns up in transcripts that are not prompts at all.
+new_case health_resume_gate_scrollback
+: > "$STATE/session"
+printf 'we talked about the "Resume from summary" prompt yesterday\n' > "$STATE/pane"
+printf 'an ordinary conversation\n' > "$STATE/screen"
+status_bar "$STATE/screen"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
+
+check "a transcript mentioning it is not a prompt" '[ ! -s "$STATE/keys" ]'
+check "the session is left alone"                  '[ -f "$STATE/session" ]'
+
 # --- an unreadable state is not a failure ------------------------------------
 # No status bar and no banner means the script cannot tell, and killing a
-# working session over that is worse than leaving it be.
+# working session over that is worse than leaving it be — for a while. The
+# default leash is CLAUDE_TMUX_UNKNOWN_STRIKES checks long, so one is tolerated.
 new_case health_unknown_left_alone
 : > "$STATE/session"
 printf 'no chrome this version renders differently\n' > "$STATE/screen"
@@ -582,6 +639,30 @@ printf 'nothing conclusive here either\n' > "$STATE/head"
 run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
 
 check "an unknown state survives" '[ -f "$STATE/session" ]'
+
+# --- but "unknown" cannot mean "healthy" forever -----------------------------
+# A session wedged behind a prompt this script does not recognise reads unknown
+# on every check. Leaving that alone indefinitely is what kept one offline for
+# two days, so the tolerance runs out and the session is recycled.
+new_case health_unknown_eventually_recycled
+: > "$STATE/session"
+printf 'a full-screen prompt no version of this script has heard of\n' > "$STATE/screen"
+printf 'nothing conclusive here either\n' > "$STATE/head"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_UNKNOWN_STRIKES=1
+
+check "a session stuck on unknown is recycled" '[ ! -f "$STATE/session" ]'
+check "and the pass reports failure"           '[ "$RC" -ne 0 ]'
+check "the log says the bar is unreadable"     'grep -q "without a readable" "$OUT"'
+check "the user is told"                       'grep -q "stopped reporting its status" "$STATE/notify"'
+
+# --- that tolerance can be switched off too ----------------------------------
+new_case health_unknown_disabled
+: > "$STATE/session"
+printf 'a full-screen prompt no version of this script has heard of\n' > "$STATE/screen"
+printf 'nothing conclusive here either\n' > "$STATE/head"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_UNKNOWN_STRIKES=0
+
+check "CLAUDE_TMUX_UNKNOWN_STRIKES=0 leaves it be" '[ -f "$STATE/session" ]'
 
 # --- health checks can be switched off ---------------------------------------
 new_case health_disabled

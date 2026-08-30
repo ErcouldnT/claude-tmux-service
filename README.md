@@ -92,6 +92,36 @@ it is recycled — and recycling *is* the repair, because starting `claude` agai
 refreshes the token. No login is involved, which is why this isn't treated as a
 logout.
 
+### A blocked prompt is not a healthy session
+
+Pinning the conversation has a consequence that shows up only after weeks:
+a conversation grows, and past a size threshold `claude` stops resuming it
+outright and asks first —
+
+```
+This session is 1d 5h old and 210.6k tokens.
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+```
+
+Nobody is watching this pane, so that question blocks forever. Worse, it is a
+full-screen chooser: it covers the status bar the registration check reads, so
+the session stops reporting `/rc failed` and starts reporting nothing at all.
+Left to itself the machine sits offline behind a tmux session that looks
+perfectly alive, and `systemctl status` says `active (running)` throughout.
+
+Two answers, because one is not enough:
+
+1. **The chooser is answered**, at spawn time and on a running session, with
+   *Resume from summary* — it keeps the conversation, which is the whole point
+   of pinning one, and sheds the weight that raised the question. Matched on
+   the visible screen, never the scrollback, since this prompt recurs and a
+   transcript that once discussed it contains the phrase verbatim.
+2. **An unreadable status bar is counted**, over `CLAUDE_TMUX_UNKNOWN_STRIKES`
+   checks, and then the session is recycled. This is the backstop for the next
+   prompt, the one this script has not been taught yet.
+
 ### What counts as proof of registration
 
 Claude Code prints the `remote-control is active` banner once, at startup, and
@@ -106,9 +136,14 @@ that has ever discussed its own registration carries both the banner and a
 anything about the present. So the checks read the status bar first and fall
 back to the *opening* output; a phrase anywhere else is ignored.
 
-When neither is conclusive the state is *unknown*, and an unknown session is
-left alone. Killing a working session because a future release renamed its
-chrome would be worse than the problem being solved.
+When neither is conclusive the state is *unknown*. An unknown session is given
+a long leash — far longer than a failing one — because killing a working
+session over a future release renaming its chrome would be worse than the
+problem being solved. But the leash ends: after `CLAUDE_TMUX_UNKNOWN_STRIKES`
+consecutive unreadable checks the session is recycled anyway. Treating unknown
+as *healthy*, with no limit, is exactly what once let a session sit wedged
+behind a prompt for two days. Set `CLAUDE_TMUX_UNKNOWN_STRIKES=0` to restore
+the old never-recycle behaviour.
 
 Repeated failures back off — the retry delay doubles up to
 `CLAUDE_TMUX_MAX_BACKOFF` — so a genuinely broken setup (logged out, banner
@@ -354,6 +389,16 @@ CLAUDE_TMUX_HEALTH=300
 # a reconnect that is merely in progress is given time to finish
 CLAUDE_TMUX_HEALTH_STRIKES=2
 
+# consecutive checks with an *unreadable* status bar before the session is
+# recycled — a much longer leash than an outright failure, because the usual
+# cause is nothing at all; 0 never recycles on an unknown reading
+CLAUDE_TMUX_UNKNOWN_STRIKES=6
+
+# the menu text of the prompt claude raises before resuming a large
+# conversation, which the watchdog answers with "Resume from summary"
+# override only if a future Claude Code release renames it
+CLAUDE_TMUX_RESUME_GATE=Resume from summary
+
 # ceiling for the retry delay after repeated failures, seconds
 CLAUDE_TMUX_MAX_BACKOFF=300
 
@@ -573,13 +618,23 @@ session.
   refreshes the token; `claude-remote-start.sh stop && claude-remote-start.sh
   start` does it immediately. This needs no login, so `status` reports a failed
   registration rather than a logout.
+- **The machine is offline, the service is `active (running)`, and `tmux
+  attach` shows claude sitting on a question nobody answered.** Usually the
+  resume chooser (`Resume from summary / Resume full session as-is`), raised
+  because the pinned conversation grew large. It blocks startup and covers the
+  status bar, so `status` reports the registration as *unconfirmed* rather than
+  failed. Current versions answer it automatically; if you are looking at one
+  anyway, press `1`, and check that `CLAUDE_TMUX_RESUME_GATE` still matches the
+  menu text. `claude-remote-start.sh reset` drops the conversation entirely if
+  you would rather it stopped growing.
 - **The session is killed and recreated every few minutes, but `tmux attach`
   shows a healthy, connected claude.** The verification markers no longer
   match. Check what the pane's status bar actually prints and set
   `CLAUDE_TMUX_RC_OK` / `CLAUDE_TMUX_RC_FAILED` (or `CLAUDE_TMUX_READY` for the
-  startup banner) to a substring of it — or set `CLAUDE_TMUX_HEALTH=0` to stop
-  re-checking a running session and `CLAUDE_TMUX_VERIFY=0` to turn spawn
-  verification off.
+  startup banner) to a substring of it. If the bar is simply unreadable to the
+  script, `CLAUDE_TMUX_UNKNOWN_STRIKES=0` stops it recycling on that alone —
+  or set `CLAUDE_TMUX_HEALTH=0` to stop re-checking a running session and
+  `CLAUDE_TMUX_VERIFY=0` to turn spawn verification off.
 - **The session comes back empty after a restart.** Check `status` for the
   `conversation …` line. No line means nothing is pinned — either
   `CLAUDE_TMUX_RESUME=0`, or the conversation was dropped because it kept

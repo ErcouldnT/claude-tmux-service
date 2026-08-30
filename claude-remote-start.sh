@@ -43,6 +43,11 @@
 #                            (default: 300 seconds, 0 disables)
 #   CLAUDE_TMUX_HEALTH_STRIKES  consecutive failed checks before recycling
 #                            (default: 2)
+#   CLAUDE_TMUX_UNKNOWN_STRIKES  consecutive checks with an unreadable status
+#                            bar before recycling (default: 6, 0 disables)
+#   CLAUDE_TMUX_RESUME_GATE  menu text of the prompt claude raises before
+#                            resuming a large conversation
+#                            (default: Resume from summary)
 set -u
 
 # Cover the common install locations across distros and macOS:
@@ -68,6 +73,8 @@ RC_OK="${CLAUDE_TMUX_RC_OK:-/rc}"
 RC_FAILED="${CLAUDE_TMUX_RC_FAILED:-/rc failed}"
 HEALTH="${CLAUDE_TMUX_HEALTH:-300}"
 HEALTH_STRIKES="${CLAUDE_TMUX_HEALTH_STRIKES:-2}"
+UNKNOWN_STRIKES="${CLAUDE_TMUX_UNKNOWN_STRIKES:-6}"
+RESUME_GATE="${CLAUDE_TMUX_RESUME_GATE:-Resume from summary}"
 
 # How often to re-read the pane while verifying a fresh spawn.
 VERIFY_STEP=5
@@ -441,6 +448,39 @@ answer_gate() {
   fi
 }
 
+# The one gate that is not a first-run formality, and the only one that can
+# come up on a session that has been running for days.
+#
+# Pinning the conversation means every respawn resumes it, and a conversation
+# only grows. Past a size threshold claude stops resuming outright and asks
+# whether to take a summary instead. Nobody watches this pane, so the question
+# blocks forever — and because it is a full-screen chooser it covers the
+# status bar, which is precisely where registration_state looks. The session
+# then reads "unknown" rather than "failed", the health check calls that
+# healthy, and the machine sits offline behind a perfectly alive tmux session.
+#
+# Answer it with "Resume from summary": that keeps the conversation, which is
+# the whole point of pinning one, and sheds the weight that raised the question.
+#
+# Matched on the visible screen, never the scrollback. This gate recurs rather
+# than firing once per machine, and with --resume the scrollback is the resumed
+# transcript — which, for a conversation that has ever discussed this very
+# prompt, contains the phrase verbatim.
+resume_gate_up() {
+  contains "$(pane_screen)" "$RESUME_GATE"
+}
+
+answer_resume_gate() {
+  log "answering the resume prompt for '$SESSION' with 'Resume from summary'"
+  tmux send-keys -t "$SESSION" "1"
+  sleep 2
+  # Same reasoning as answer_gate: confirm only if the chooser is still up, so
+  # a menu that acted on the digit alone does not take a stray Enter as well.
+  if resume_gate_up; then
+    tmux send-keys -t "$SESSION" Enter
+  fi
+}
+
 # Confirm that a freshly spawned session actually registered with Remote
 # Control. Returns 0 once the banner appears; otherwise kills the session so
 # the next watchdog pass starts from a clean slate.
@@ -516,6 +556,14 @@ verify_session() {
       return 1
     fi
 
+    # Not a first-run gate: this one appears on any spawn that resumes a
+    # conversation grown past claude's size threshold. Answered before the
+    # gates below, which read the scrollback through a screen it is covering.
+    if resume_gate_up; then
+      answer_resume_gate
+      continue
+    fi
+
     # A machine's first launch hits one-time gates that block until answered,
     # and an unattended session has nobody to answer them: the theme picker,
     # the workspace trust prompt, then — because the default ARGS pass
@@ -577,15 +625,24 @@ verify_session() {
 # So re-check a session that is already up, every $HEALTH seconds. Recycling it
 # is the repair: starting claude again refreshes the token.
 #
-# Two things keep this from fighting a working session. Only an explicit
-# "failed" from the status bar counts — "unknown" is left alone. And it has to
-# say so $HEALTH_STRIKES checks running, so a reconnect that is merely in
-# progress is given time to finish.
+# Two things keep this from fighting a working session. An explicit "failed"
+# from the status bar has to say so $HEALTH_STRIKES checks running, so a
+# reconnect that is merely in progress is given time to finish. And an
+# unreadable status bar — "unknown" — is judged far more slowly still, over
+# $UNKNOWN_STRIKES checks, because the cause is usually nothing at all.
+#
+# "unknown" is nevertheless counted rather than ignored. Leaving it alone
+# entirely is what allowed the failure this check exists to catch: claude put a
+# full-screen prompt over its own status bar, the reading stopped being
+# "failed" and became "unknown", and the wedged session was called healthy for
+# two days. Recognised prompts are answered outright (see resume_gate_up); the
+# strike count is the backstop for the ones that are not.
 # Zero, not "now", so the first pass over an already-running session checks it
 # rather than trusting it for $HEALTH seconds. That is the case where trust is
 # least earned: the watchdog has just started and has verified nothing.
 HEALTH_LAST=0
 HEALTH_SEEN=0
+UNKNOWN_SEEN=0
 session_healthy() {
   [ "$HEALTH" -gt 0 ] || return 0
 
@@ -593,11 +650,45 @@ session_healthy() {
   [ $((_now - HEALTH_LAST)) -ge "$HEALTH" ] || return 0
   HEALTH_LAST=$_now
 
-  if [ "$(registration_state)" != failed ]; then
-    HEALTH_SEEN=0
+  # A prompt that came up long after startup blocks the session exactly as one
+  # during startup would, and answering it beats recycling: the conversation
+  # survives. Checked before the state is read, because this prompt is what
+  # covers the status bar that the reading depends on.
+  if resume_gate_up; then
+    answer_resume_gate
     return 0
   fi
 
+  _state=$(registration_state)
+
+  if [ "$_state" = active ]; then
+    HEALTH_SEEN=0
+    UNKNOWN_SEEN=0
+    return 0
+  fi
+
+  # "unknown" still does not mean "failed" — the status bar can be unreadable
+  # for a frame, and Claude Code renaming its chrome must not cost a working
+  # session. But it cannot mean "healthy" forever either: a session wedged
+  # behind some prompt this script does not recognise reads "unknown" on every
+  # single check, and trusting that is what let one sit offline for two days.
+  # So tolerate it on a much longer leash than an outright failure, then
+  # recycle — the same repair, for a session that is just as stuck.
+  if [ "$_state" != failed ]; then
+    HEALTH_SEEN=0
+    [ "$UNKNOWN_STRIKES" -gt 0 ] || return 0
+    UNKNOWN_SEEN=$((UNKNOWN_SEEN + 1))
+    [ "$UNKNOWN_SEEN" -ge "$UNKNOWN_STRIKES" ] || return 0
+    log "session '$SESSION' has gone $UNKNOWN_SEEN checks without a readable"
+    log "status bar; recycling it. Something is covering it — attach with"
+    log "'tmux attach -t $SESSION' if this keeps happening."
+    notify_once "Claude session stopped reporting its status — restarting it."
+    UNKNOWN_SEEN=0
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    return 1
+  fi
+
+  UNKNOWN_SEEN=0
   HEALTH_SEEN=$((HEALTH_SEEN + 1))
   if [ "$HEALTH_SEEN" -lt "$HEALTH_STRIKES" ]; then
     log "session '$SESSION' reports a failed Remote Control registration;"
