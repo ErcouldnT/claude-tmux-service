@@ -800,11 +800,22 @@ login_screen() {
 # the lines that follow while they still look like URL (a single run of
 # non-blank characters). claude's own prose is indented and spaced, so the
 # first line with a space in it ends the URL.
+# The first-run flow puts the sign-in URL on a line of its own; `claude auth
+# login` prefixes it with "If the browser didn't open, visit: ". So find it
+# anywhere on the line rather than anchoring at the start, and keep the
+# continuation rule for the case where it still wraps.
 login_url() {
   login_pane | awk '
-    /^https:\/\/[^ 	]*oauth/ { url = $0; more = 1; next }
-    more && /^[^ 	]+$/       { url = url $0; next }
-    more                      { more = 0 }
+    {
+      if (more) {
+        if ($0 ~ /^[^ 	]+$/) { url = url $0; next }
+        more = 0
+      }
+      if (match($0, /https:\/\/[^ 	]+/)) {
+        cand = substr($0, RSTART, RLENGTH)
+        if (cand ~ /oauth/) { url = cand; more = 1 }
+      }
+    }
     END { if (url != "") print url }
   '
 }
@@ -827,6 +838,23 @@ onboarding_done() {
   grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$ONBOARD_STATE"
 }
 
+# Whether there is a live claude.ai session behind that onboarding. These are
+# different facts, and treating the first as proof of the second is what made
+# `login` useless on the one machine it exists for: hasCompletedOnboarding is
+# written once and stays true forever, so a box that onboarded months ago and
+# has since had its token expire reported "Setup complete" instantly, never
+# reached the code step, and left the service exactly as logged out as it
+# found it.
+logged_in() {
+  claude auth status 2>/dev/null |
+    grep -q '"loggedIn"[[:space:]]*:[[:space:]]*true'
+}
+
+# What `login` is actually trying to reach.
+setup_done() {
+  onboarding_done && logged_in
+}
+
 login_cleanup() {
   tmux kill-session -t "$LOGIN_SESSION" 2>/dev/null
   return 0
@@ -839,18 +867,31 @@ do_login() {
   # A wide pane leaves the URL with fewer wrap points to be rebuilt from. No
   # --remote-control: this session is here to answer setup, and registering it
   # would collide with the one the watchdog owns.
-  # shellcheck disable=SC2086 — ARGS is intentionally word-split
-  tmux new-session -d -s "$LOGIN_SESSION" -x 200 -y 50 -c "$HOME" \
-    claude $ARGS || die "could not start the login session"
-
-  echo "Walking Claude Code's first-run setup..." >&2
+  if onboarding_done; then
+    # Nothing is left to onboard: only the token lapsed. The TUI will not offer
+    # a login menu in that state — it opens as an ordinary session and does not
+    # complain until something needs the network — so there is no screen here
+    # to drive. Ask for the sign-in directly. The loop below still works, since
+    # `claude auth login` prints the same URL and waits at the same "Paste code
+    # here" prompt.
+    echo "Signing in to claude.ai..." >&2
+    tmux new-session -d -s "$LOGIN_SESSION" -x 200 -y 50 -c "$HOME" \
+      claude auth login --claudeai || die "could not start the login session"
+  else
+    # shellcheck disable=SC2086 — ARGS is intentionally word-split
+    tmux new-session -d -s "$LOGIN_SESSION" -x 200 -y 50 -c "$HOME" \
+      claude $ARGS || die "could not start the login session"
+    echo "Walking Claude Code's first-run setup..." >&2
+  fi
 
   code_sent=0
   waited=0
 
   while [ "$waited" -lt "$LOGIN_BUDGET" ]; do
-    if onboarding_done; then
-      echo "Setup complete." >&2
+    # Checked before the has-session test below, so the auth path — where a
+    # successful sign-in ends by exiting — is read as the success it is.
+    if setup_done; then
+      echo "Signed in." >&2
       login_cleanup
       clear_logged_out
       # The watchdog backs off hard on a machine it cannot fix, so left alone

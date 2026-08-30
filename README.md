@@ -251,11 +251,19 @@ On a headless box, prefer this over `claude auth login`:
 ~/.local/bin/claude-remote-start.sh login
 ```
 
-It walks Claude Code's whole first run — theme picker, login method, the
-sign-in, the two "press Enter" notices, the trust prompt, the Bypass warning —
-and stops only at the one step that genuinely needs a person: it prints the
-sign-in URL and waits for you to paste the code back. Then it drops the stale
-session so the watchdog rebuilds it within one interval.
+It handles the two situations separately, because they are not the same job:
+
+- **A machine that has never been set up** gets the whole first run walked —
+  theme picker, login method, the sign-in, the two "press Enter" notices, the
+  trust prompt, the Bypass warning.
+- **A machine that was set up long ago and has only had its token expire** gets
+  `claude auth login` driven directly. There is no first-run screen to walk in
+  that state: the TUI opens as an ordinary session and does not mention the
+  lapsed token until something needs the network.
+
+Either way it stops at the one step that genuinely needs a person: it prints
+the sign-in URL and waits for you to paste the code back. Then it drops the
+stale session so the watchdog rebuilds it within one interval.
 
 Two reasons it exists rather than pointing you at `claude auth login`:
 
@@ -272,6 +280,13 @@ Leaving the run unfinished is not harmless: `hasCompletedOnboarding` is only
 written once it reaches the end, so a session killed at the sign-in screen
 sends the machine back to the theme picker on every start, forever. `login`
 waits for that flag before reporting success.
+
+But that flag is only half the answer, and reading it as the whole answer was a
+bug worth naming here: it is written once and never cleared, so on an onboarded
+machine it stays true no matter what happens to the token. `login` used to stop
+at it and report success — instantly, without ever printing a URL — on exactly
+the machine it exists to repair. Success now means the flag **and** a live
+`claude auth status`.
 
 > **⚠️ Two credentials that look fine but cannot host a session.** The installer
 > warns about both, because the watchdog would otherwise retry forever on a

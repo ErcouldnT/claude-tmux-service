@@ -73,12 +73,17 @@ case "$cmd" in
     esac
     ;;
   send-keys)
-    # send-keys -t <session> <key>
-    printf '%s\n' "$4" >> "$STATE/keys"
+    # send-keys -t <session> [-l] <key>. The -l form is how the login
+    # walkthrough pastes the code, which carries a '#' tmux would otherwise
+    # read as a format string; record the code itself, not the flag. A pasted
+    # code standing in for an accepted one is what flips the stub account to
+    # signed-in below.
+    if [ "$4" = -l ]; then key=$5; : > "$STATE/code_sent"; else key=$4; fi
+    printf '%s\n' "$key" >> "$STATE/keys"
     # Digits advance as well as Enter: claude's menus act on the number key
     # alone, which is the whole reason answer_gate has to check afterwards
     # whether the gate is still up before confirming.
-    case "$4" in
+    case "$key" in
       Enter|[0-9])
         n=$(cat "$STATE/step" 2>/dev/null || echo 0)
         n=$((n + 1))
@@ -119,6 +124,43 @@ run_cmd() {
     XDG_STATE_HOME="$HOME_DIR/.local/state" \
     "$@" sh "$REPO/claude-remote-start.sh" "$cmd" >"$OUT" 2>&1
   RC=$?
+}
+
+# Same as run_cmd, but feeds $1 on stdin: the login walkthrough asks for the
+# sign-in code that way.
+run_cmd_in() {
+  input=$1; cmd=$2; shift 2
+  HOME="$HOME_DIR" STATE="$STATE" CLAUDE_TMUX_SESSION=test \
+    XDG_CONFIG_HOME="$HOME_DIR/.config" \
+    XDG_STATE_HOME="$HOME_DIR/.local/state" \
+    "$@" sh "$REPO/claude-remote-start.sh" "$cmd" >"$OUT" 2>&1 <<INPUT
+$input
+INPUT
+  RC=$?
+}
+
+# The default claude stub only has to exist. This one answers `auth status`,
+# which is how the script tells a live claude.ai session from a lapsed one —
+# signed out until a code is pasted, signed in afterwards.
+auth_stub() {
+  cat > "$STUBS/claude" <<'STUB'
+#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = status ]; then
+  if [ -f "$STATE/code_sent" ]; then
+    echo '{"loggedIn": true, "subscriptionType": "pro"}'
+  else
+    echo '{"loggedIn": false, "authMethod": "none"}'
+  fi
+fi
+:
+STUB
+  chmod +x "$STUBS/claude"
+}
+
+# A machine that finished onboarding long ago. The flag is written once and
+# never cleared, which is the trap: it says nothing about the token.
+mark_onboarded() {
+  echo '{"hasCompletedOnboarding": true}' > "$HOME_DIR/.claude.json"
 }
 
 # Where mark_logged_out drops its marker, given the XDG_STATE_HOME above.
@@ -672,6 +714,62 @@ status_bar_failed "$STATE/screen"
 run_cmd start env CLAUDE_TMUX_HEALTH=0
 
 check "CLAUDE_TMUX_HEALTH=0 disables recycling" '[ -f "$STATE/session" ]'
+
+echo
+echo "claude-remote-start.sh — the login walkthrough"
+
+# --- an onboarded box with a lapsed token still has to sign in ---------------
+# hasCompletedOnboarding is written once and stays true forever, so reading it
+# as "signed in" made this command a no-op on the only machine that needs it:
+# one that onboarded months ago and has since had its token expire.
+new_case login_onboarded_but_logged_out
+mark_onboarded
+auth_stub
+run_cmd_in "" login env CLAUDE_TMUX_LOGIN_WAIT=6
+
+check "onboarding alone is not a sign-in"  '! grep -qE "Signed in|Setup complete" "$OUT"'
+check "and the command reports failure"    '[ "$RC" -ne 0 ]'
+check "it asks claude to sign in"          'grep -q "claude auth login" "$STATE/cmd"'
+check "not the plain first-run TUI"        '! grep -q "remote-control" "$STATE/cmd"'
+
+# --- the code is relayed, and the URL survives its prefix --------------------
+# `claude auth login` prints the URL behind "If the browser didn't open,
+# visit: ", so a check anchored at the start of the line never finds it.
+new_case login_relays_the_code
+mark_onboarded
+auth_stub
+cat > "$STATE/pane" <<'PANE'
+Opening browser to sign in…
+If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&state=abc123
+Paste code here if prompted >
+PANE
+cp "$STATE/pane" "$STATE/screen"
+run_cmd_in 'theCode#abc123' login env CLAUDE_TMUX_LOGIN_WAIT=30
+
+check "the sign-in is reported"        'grep -q "Signed in" "$OUT"'
+check "and the command succeeds"       '[ "$RC" -eq 0 ]'
+check "the prefixed URL is found"      'grep -q "https://claude.com/cai/oauth/authorize" "$OUT"'
+check "the prefix is left behind"      '! grep -q "browser didn.t open" "$OUT"'
+check "the code is pasted verbatim"    'grep -qx "theCode#abc123" "$STATE/keys"'
+check "the logout marker is cleared"   '[ ! -f "$(logout_mark)" ]'
+
+# --- a box that is already signed in has nothing to do -----------------------
+new_case login_already_signed_in
+mark_onboarded
+auth_stub
+: > "$STATE/code_sent"
+run_cmd_in "" login env CLAUDE_TMUX_LOGIN_WAIT=6
+
+check "an existing sign-in is recognised" '[ "$RC" -eq 0 ]'
+check "and nothing is pasted"             '[ ! -s "$STATE/keys" ]'
+
+# --- a brand-new machine still gets the first-run walk -----------------------
+new_case login_fresh_machine
+auth_stub
+run_cmd_in "" login env CLAUDE_TMUX_LOGIN_WAIT=6
+
+check "an un-onboarded box walks the TUI" '! grep -q "auth login" "$STATE/cmd"'
+check "and says so"                       'grep -q "first-run setup" "$OUT"'
 
 rm -rf "$ROOT"
 echo
