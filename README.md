@@ -591,20 +591,25 @@ session.
   the answers in `~/.claude.json`, so each fires once per machine. Set
   `CLAUDE_TMUX_AUTO_TRUST=0` to answer them by hand instead.
 
-  Note the two menus number their entries in opposite orders — the trust prompt
-  leads with "Yes, I trust this folder", the Bypass warning with "No, exit" — so
-  each is answered by name, not by position.
-
   A brand-new install shows a third gate first, the **theme picker**, which the
   watchdog answers with "Auto (match terminal)".
 
-  These menus act on the number key alone, whatever their "Enter to confirm"
-  footer says. So the watchdog re-reads the *visible screen* after pressing the
-  digit and only sends Enter if the gate is still up. Confirming unconditionally
-  put the Enter on the following screen instead — and since the Bypass warning
-  follows the trust prompt and defaults to "No, exit", that stray keypress quit
-  claude a few seconds after every start, which reads in the log as `claude
-  exited 10s after starting` and is easy to misread as a login problem.
+  Each is answered by the *text* of the entry, never by its position or number:
+  the watchdog finds the highlight on the visible screen, steps to the entry
+  with the arrow keys, and confirms with one Enter. Nothing about these menus
+  is stable enough to answer any other way. They disagree about which entry
+  leads — the Bypass warning opens on "No, exit" — they have been numbered and
+  unnumbered, and the trust prompt has shipped both orders. Pressing a digit is
+  the trap: on an unnumbered menu it does nothing at all, and the Enter behind
+  it then confirms whatever happens to be highlighted. When that was "No, exit"
+  the session quit ten seconds after every spawn and the watchdog respawned it
+  into the same trap, which reads in the log as `claude exited 10s after
+  starting` and is easy to misread as a login problem.
+
+  An entry the watchdog cannot find on screen is reported rather than guessed
+  at — `could not find an entry matching …` — and the spawn fails. Pressing
+  Enter on an unrecognised menu would answer whichever entry leads, and on two
+  of these three that is the one that quits.
 - **Every start opens on the theme picker, or on the sign-in screen.** The first
   run was never finished, so nothing was recorded: `hasCompletedOnboarding` is
   absent from `~/.claude.json`. The sign-in step needs a person, and the

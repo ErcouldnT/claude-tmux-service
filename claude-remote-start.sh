@@ -418,9 +418,65 @@ network_ready() {
   nm-online -q -t "$NET_WAIT"
 }
 
-# Answer one of claude's first-run gates by picking menu entry $1. $2 names the
-# gate in the log. Returns 1, session already killed, when auto-answering is
-# switched off, so the caller can fail the spawn with the reason on record.
+# The mark the TUI draws on the highlighted entry of a chooser. Matched
+# alongside a plain ">" below, because that is what the same menus rendered
+# before, and a watchdog that only knows the current glyph is one redraw away
+# from the failure this whole mechanism exists to prevent.
+MENU_CURSOR="❯"
+
+# How many Down presses move the highlight from where it sits now onto the
+# entry containing $2, reading the visible screen of tmux session $1. Prints a
+# signed count — negative means Up — or nothing when either end is missing.
+#
+# These menus used to be numbered, and typing the number picked an entry
+# outright. Claude Code has since dropped the numbers, and the order is not
+# fixed either: the workspace trust prompt now opens with "No, exit"
+# highlighted. A digit is then ignored and the Enter that follows confirms
+# whatever is highlighted — which is exactly how an unattended session answers
+# "No, exit" and dies ten seconds after starting, leaving a watchdog to respawn
+# it into the same trap forever. Navigating to an entry by its text works
+# whichever layout is up, and whichever entry leads, so every caller does that.
+#
+# Only the visible screen, and only the first cursor on it: a dismissed chooser
+# stays in the scrollback, and the prompt box draws the same mark below.
+menu_delta() {
+  tmux capture-pane -t "$1" -p 2>/dev/null | awk -v t="$2" -v c="$MENU_CURSOR" '
+    { n++ }
+    !cur && (index($0, c) || $0 ~ /^[ \t]*> /) { cur = n }
+    !tgt && index($0, t) { tgt = n }
+    END { if (cur && tgt) print tgt - cur }
+  '
+}
+
+# Move session $1's highlight onto the entry containing $2 and confirm it.
+# Returns 1 without touching the session when that entry is not on screen, so a
+# caller can report a menu it no longer recognises instead of pressing Enter on
+# whatever happens to be selected.
+menu_pick() {
+  _d=$(menu_delta "$1" "$2")
+  case "${_d:-}" in
+    ""|*[!0-9-]*) return 1 ;;
+  esac
+  _key=Down
+  if [ "$_d" -lt 0 ]; then
+    _key=Up
+    _d=$((0 - _d))
+  fi
+  while [ "$_d" -gt 0 ]; do
+    tmux send-keys -t "$1" "$_key"
+    sleep 1
+    _d=$((_d - 1))
+  done
+  # Arrow keys only move the highlight, so unlike a digit they never advance
+  # the screen on their own: the Enter here is always the one that answers.
+  tmux send-keys -t "$1" Enter
+  return 0
+}
+
+# Answer one of claude's first-run gates by selecting the entry whose text
+# contains $1. $2 names the gate in the log. Returns 1, session already killed,
+# when auto-answering is switched off or the entry is not on screen, so the
+# caller can fail the spawn with the reason on record.
 answer_gate() {
   if [ "$AUTO_TRUST" = 0 ]; then
     log "claude is waiting on the $2 for $HOME."
@@ -430,22 +486,17 @@ answer_gate() {
     return 1
   fi
   log "answering the $2 for $HOME"
-  # Pick by number rather than by position: the two menus disagree about which
-  # entry comes first, and Bypass Permissions leads with "No, exit".
-  tmux send-keys -t "$SESSION" "$1"
-  sleep 2
-
-  # Then confirm — but only if the gate is still up. Some of these menus act on
-  # the digit alone and advance immediately, whatever their "Enter to confirm"
-  # footer says. An unconditional Enter therefore lands on whichever screen came
-  # next, and the screen after the trust prompt is the Bypass warning, which
-  # defaults to "No, exit": the stray Enter quits claude a few seconds after
-  # starting it. Matching on the visible screen, not the scrollback, is what
-  # makes "did it advance?" answerable at all — the scrollback shows the gate
-  # either way. $3 is the text that identified this gate.
-  if contains "$(pane_screen)" "$3"; then
-    tmux send-keys -t "$SESSION" Enter
+  if menu_pick "$SESSION" "$1"; then
+    return 0
   fi
+  # Pressing Enter anyway would answer whatever is highlighted, and on both of
+  # these menus that is "No, exit". Say what was not found instead: a reworded
+  # entry is a one-line fix here, and silence would present as a machine that
+  # simply never comes online.
+  log "could not find an entry matching '$1' on the $2;"
+  log "if Claude Code reworded it, that string is what needs updating."
+  tmux kill-session -t "$SESSION" 2>/dev/null
+  return 1
 }
 
 # The one gate that is not a first-run formality, and the only one that can
@@ -472,13 +523,8 @@ resume_gate_up() {
 
 answer_resume_gate() {
   log "answering the resume prompt for '$SESSION' with 'Resume from summary'"
-  tmux send-keys -t "$SESSION" "1"
-  sleep 2
-  # Same reasoning as answer_gate: confirm only if the chooser is still up, so
-  # a menu that acted on the digit alone does not take a stray Enter as well.
-  if resume_gate_up; then
-    tmux send-keys -t "$SESSION" Enter
-  fi
+  menu_pick "$SESSION" "Resume from summary" ||
+    log "could not find 'Resume from summary' on the resume prompt; leaving it up"
 }
 
 # Confirm that a freshly spawned session actually registered with Remote
@@ -580,19 +626,19 @@ verify_session() {
     # Nothing downstream reads the theme and nobody watches this pane, so take
     # "Auto (match terminal)" and leave the terminal's own colours alone.
     if [ "$theme_answered" -eq 0 ] && contains "$out" "Choose the text style"; then
-      answer_gate 1 "theme picker" "Choose the text style" || return 1
+      answer_gate "Auto" "theme picker" "Choose the text style" || return 1
       theme_answered=1
       continue
     fi
 
     if [ "$trust_answered" -eq 0 ] && contains "$out" "trust this folder"; then
-      answer_gate 1 "workspace trust prompt" "trust this folder" || return 1
+      answer_gate "I trust this folder" "workspace trust prompt" "trust this folder" || return 1
       trust_answered=1
       continue
     fi
 
     if [ "$bypass_answered" -eq 0 ] && contains "$out" "Bypass Permissions mode"; then
-      answer_gate 2 "Bypass Permissions warning" "Bypass Permissions mode" || return 1
+      answer_gate "Yes, I accept" "Bypass Permissions warning" "Bypass Permissions mode" || return 1
       bypass_answered=1
       continue
     fi
@@ -820,17 +866,14 @@ login_url() {
   '
 }
 
-# Pick menu entry $1, named $2, identified on screen by $3. Same shape as
-# answer_gate, including why the Enter is conditional: these menus act on the
-# digit alone, and an Enter that arrives after the screen has moved on lands on
-# the next one — where it would answer the Bypass warning's "No, exit".
+# Select the entry containing $1, on the menu named $2. Same shape as
+# answer_gate, and navigating for the same reason: these menus are no longer
+# numbered, so a digit is ignored and the Enter behind it would confirm
+# whatever leads — on two of them, "No, exit".
 login_pick() {
   echo "  answering the $2" >&2
-  tmux send-keys -t "$LOGIN_SESSION" "$1"
-  sleep 2
-  if contains "$(login_screen)" "$3"; then
-    tmux send-keys -t "$LOGIN_SESSION" Enter
-  fi
+  menu_pick "$LOGIN_SESSION" "$1" ||
+    echo "  could not find an entry matching '$1' on the $2" >&2
 }
 
 onboarding_done() {
@@ -913,13 +956,13 @@ do_login() {
     screen=$(login_screen)
 
     if contains "$screen" "Choose the text style"; then
-      login_pick 1 "theme picker" "Choose the text style"
+      login_pick "Auto" "theme picker" "Choose the text style"
       sleep 3
       continue
     fi
 
     if contains "$screen" "Select login method"; then
-      login_pick 1 "login method (Claude subscription)" "Select login method"
+      login_pick "Claude account with subscription" "login method" "Select login method"
       sleep 5
       continue
     fi
@@ -963,13 +1006,13 @@ do_login() {
     fi
 
     if contains "$screen" "trust this folder"; then
-      login_pick 1 "workspace trust prompt" "trust this folder"
+      login_pick "I trust this folder" "workspace trust prompt" "trust this folder"
       sleep 3
       continue
     fi
 
     if contains "$screen" "Bypass Permissions mode"; then
-      login_pick 2 "Bypass Permissions warning" "Bypass Permissions mode"
+      login_pick "Yes, I accept" "Bypass Permissions warning" "Bypass Permissions mode"
       sleep 3
       continue
     fi

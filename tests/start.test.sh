@@ -207,6 +207,17 @@ Quick safety check: Is this a project you created or one you trust?
 PANE
 }
 
+# The same prompt as claude renders it now: no numbers, and "No, exit" first.
+trust_prompt_unnumbered() {
+  cat >> "$1" <<'PANE'
+Accessing workspace:
+/Users/ercode
+Quick safety check: Is this a project you created or one you trust?
+❯ No, exit
+  Yes, I trust this folder
+PANE
+}
+
 bypass_prompt() {
   cat >> "$1" <<'PANE'
 WARNING: Claude Code running in Bypass Permissions mode
@@ -271,9 +282,38 @@ run_cmd start
 
 check "answered trust prompt verifies"    '[ "$RC" -eq 0 ]'
 check "session left running"              '[ -f "$STATE/session" ]'
-check "picks 'Yes, I trust this folder'"  'grep -qx 1 "$STATE/keys"'
+check "is already on 'Yes, I trust this folder'" '! grep -qxE "Up|Down" "$STATE/keys"'
 check "confirms with Enter"               'grep -qx Enter "$STATE/keys"'
+check "sends no digit"                    '! grep -qxE "[0-9]" "$STATE/keys"'
 check "says what it did"                  'grep -q "answering the workspace trust prompt" "$OUT"'
+
+# --- the layout that broke this on a real machine ---------------------------
+# Claude Code dropped the numbers from this menu and opened it on "No, exit".
+# A digit is ignored there, and the Enter behind it confirmed the exit: claude
+# died ten seconds after every spawn, and the watchdog respawned it into the
+# same trap. Navigating to the entry by its text is what survives both layouts.
+new_case trust_reordered
+trust_prompt_unnumbered "$STATE/pane"
+trust_prompt_unnumbered "$STATE/step1"; banner "$STATE/step1"
+run_cmd start
+
+check "the reordered prompt verifies"     '[ "$RC" -eq 0 ]'
+check "session left running"              '[ -f "$STATE/session" ]'
+check "moves onto the trust entry"        '[ "$(sed -n 1p "$STATE/keys")" = Down ]'
+check "then confirms it"                  '[ "$(sed -n 2p "$STATE/keys")" = Enter ]'
+check "never confirms 'No, exit'"         '[ "$(grep -cx Enter "$STATE/keys")" -eq 1 ]'
+
+# --- an entry the script cannot find is reported, not guessed at ------------
+# Pressing Enter on an unrecognised menu would answer whatever is highlighted,
+# and on both of these menus that is the one that quits.
+new_case trust_reworded
+printf 'Quick safety check: do you trust this folder?\n\u276f No, exit\n  Sure, go ahead\n' > "$STATE/pane"
+run_cmd start
+
+check "a reworded menu fails the spawn"   '[ "$RC" -ne 0 ]'
+check "and nothing is confirmed"          '! grep -qx Enter "$STATE/keys"'
+check "the session is recycled"           '[ ! -f "$STATE/session" ]'
+check "the log names the missing entry"   'grep -q "could not find an entry matching" "$OUT"'
 
 # --- the Bypass Permissions gate numbers its entries the other way around ---
 # "1" here is "No, exit": answering this gate the way the trust prompt is
@@ -285,21 +325,21 @@ run_cmd start
 
 check "answered bypass warning verifies" '[ "$RC" -eq 0 ]'
 check "session left running"             '[ -f "$STATE/session" ]'
-check "picks 'Yes, I accept', not 'No'"  '[ "$(head -n1 "$STATE/keys")" = 2 ]'
-check "never sends the exit entry"       '! grep -qx 1 "$STATE/keys"'
+check "moves onto 'Yes, I accept'"       '[ "$(sed -n 1p "$STATE/keys")" = Down ]'
+check "never confirms 'No, exit'"        '[ "$(sed -n 1p "$STATE/keys")" != Enter ]'
 check "says what it did"                 'grep -q "answering the Bypass Permissions warning" "$OUT"'
 
 # --- the resume chooser is answered, and the session comes up ---------------
 new_case resume_gate
 resume_prompt "$STATE/screen"
-# Picking an entry advances straight past it: claude's menus act on the digit.
+# The chooser already sits on the entry we want, so Enter alone answers it.
 banner "$STATE/step1"; banner "$STATE/screen1"
 run_cmd start
 
 check "the resume prompt verifies"      '[ "$RC" -eq 0 ]'
 check "session left running"            '[ -f "$STATE/session" ]'
-check "picks 'Resume from summary'"     '[ "$(head -n1 "$STATE/keys")" = 1 ]'
-check "no stray Enter once it advances" '! grep -qx Enter "$STATE/keys"'
+check "picks 'Resume from summary'"     '[ "$(sed -n 1p "$STATE/keys")" = Enter ]'
+check "and confirms it exactly once"    '[ "$(grep -cx Enter "$STATE/keys")" -eq 1 ]'
 check "says what it did"                'grep -q "answering the resume prompt" "$OUT"'
 
 # --- the sign-in screen needs a person, so the watchdog must not sit on it --
@@ -322,16 +362,16 @@ run_cmd start
 
 check "answered theme picker verifies"   '[ "$RC" -eq 0 ]'
 check "session left running"             '[ -f "$STATE/session" ]'
-check "picks 'Auto (match terminal)'"    '[ "$(head -n1 "$STATE/keys")" = 1 ]'
+check "moves up to 'Auto (match terminal)'" '[ "$(sed -n 1p "$STATE/keys")" = Up ]'
+check "then confirms it"                 '[ "$(sed -n 2p "$STATE/keys")" = Enter ]'
 check "says what it did"                 'grep -q "answering the theme picker" "$OUT"'
 
 # --- all three gates in a row, which is what a fresh machine actually shows -
-# Modelled the way claude really behaves: the number key alone dismisses each
-# menu. The scrollback accumulates, so every gate stays matchable there, while
-# the screen shows only the gate currently up. A watchdog that confirmed with
-# an unconditional Enter would land it on the *next* screen — and since the
-# Bypass warning that follows the trust prompt leads with "No, exit", that
-# stray Enter quits claude. So: three digits, and not one Enter.
+# The scrollback accumulates, so every gate stays matchable there, while the
+# screen shows only the gate currently up — which is why the entry is located
+# on the screen and never in the scrollback. Each gate takes the arrows it
+# needs to reach its entry and exactly one Enter to confirm it, and the three
+# gates disagree about where that entry sits: above, on, and below the cursor.
 new_case all_gates
 theme_prompt "$STATE/pane"
 theme_prompt "$STATE/screen"
@@ -344,11 +384,12 @@ banner "$STATE/screen3"
 run_cmd start
 
 check "every gate gets through" '[ "$RC" -eq 0 ]'
-check "theme answered first"    '[ "$(head -n1 "$STATE/keys")" = 1 ]'
-check "trust answered next"     '[ "$(grep -x "[12]" "$STATE/keys" | sed -n 2p)" = 1 ]'
-check "bypass answered last"    '[ "$(grep -x "[12]" "$STATE/keys" | sed -n 3p)" = 2 ]'
-check "one digit per gate"      '[ "$(grep -cx "[12]" "$STATE/keys")" -eq 3 ]'
-check "no stray Enter is sent"  '! grep -qx Enter "$STATE/keys"'
+check "theme reaches up for Auto"  '[ "$(sed -n 1p "$STATE/keys")" = Up ]'
+check "theme is confirmed"        '[ "$(sed -n 2p "$STATE/keys")" = Enter ]'
+check "trust confirms in place"   '[ "$(sed -n 3p "$STATE/keys")" = Enter ]'
+check "bypass steps off 'No'"     '[ "$(sed -n 4p "$STATE/keys")" = Down ]'
+check "bypass is confirmed"       '[ "$(sed -n 5p "$STATE/keys")" = Enter ]'
+check "one Enter per gate"        '[ "$(grep -cx Enter "$STATE/keys")" -eq 3 ]'
 
 # --- a dismissed prompt lingers in the scrollback and must not be re-answered
 # Without a guard, every 5s pass would re-match the prompt text still sitting
@@ -359,7 +400,7 @@ run_cmd start
 
 check "gives up when the banner never lands" '[ "$RC" -ne 0 ]'
 check "recycles the session"                 '[ ! -f "$STATE/session" ]'
-check "answers exactly once"                 '[ "$(grep -cx 1 "$STATE/keys")" -eq 1 ]'
+check "answers exactly once"                 '[ "$(wc -l < "$STATE/keys")" -eq 1 ]'
 check "sends exactly one Enter"              '[ "$(grep -cx Enter "$STATE/keys")" -eq 1 ]'
 
 # --- opting out leaves the gates alone --------------------------------------
@@ -654,7 +695,7 @@ banner "$STATE/step1"; banner "$STATE/screen1"
 run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_HEALTH_STRIKES=1
 
 check "the gate is answered, not recycled" '[ -f "$STATE/session" ]'
-check "picks 'Resume from summary'"        '[ "$(head -n1 "$STATE/keys")" = 1 ]'
+check "picks 'Resume from summary'"        '[ "$(sed -n 1p "$STATE/keys")" = Enter ]'
 check "and the pass succeeds"              '[ "$RC" -eq 0 ]'
 
 # --- the chooser is read off the screen, never the scrollback ----------------
