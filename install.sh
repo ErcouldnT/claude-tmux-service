@@ -147,21 +147,70 @@ ensure_tmux() {
 }
 
 # --- Prerequisite: Claude Code ---------------------------------------------
+# Only the official installer's copy counts. It lives in ~/.local/bin (a link)
+# plus ~/.local/share/claude (the versions), and it updates itself in the
+# background. A Homebrew cask or an npm package does neither: it stays on the
+# version it was installed at until someone upgrades it by hand, and Remote
+# Control is the kind of feature that moves quickly enough for that to matter.
+# So a package-manager copy is not "already installed" — the official one is
+# installed next to it. The watchdog puts ~/.local/bin first on PATH, so the
+# new copy wins without touching the old one. Same definition as uninstall.sh.
+native_claude() { [ -x "$HOME/.local/bin/claude" ] && [ -d "$HOME/.local/share/claude" ]; }
+
+# How to remove a copy the official installer did not put there. Printed, never
+# run: taking a package away from its manager is the user's call.
+removal_hint() {
+  case "$1" in
+  */linuxbrew/* | /opt/homebrew/* | */Caskroom/*) echo "brew uninstall --cask claude-code" ;;
+  */node_modules/* | */npm*/*) echo "npm uninstall -g @anthropic-ai/claude-code" ;;
+  *) echo "remove it with whatever installed it" ;;
+  esac
+}
+
 ensure_claude() {
-  have claude && return 0
+  native_claude && return 0
+
+  other=""
+  if have claude; then
+    other=$(command -v claude)
+    say "Claude Code is installed at $other, but not by the official installer,"
+    say "so it will not update itself."
+  else
+    say "Claude Code is not installed."
+  fi
+
   if [ "$WITH_DEPS" -eq 0 ]; then
-    warn "'claude' not found in PATH; the service will retry until it is installed."
+    if [ -n "$other" ]; then
+      warn "leaving it as is (--no-deps); it will stay on its current version."
+    else
+      warn "'claude' not found in PATH; the service will retry until it is installed."
+    fi
     return 0
   fi
+
   have curl || die "curl is required to install Claude Code"
-  say "Claude Code is not installed."
   confirm "Install it now with the official installer?" || {
-    warn "skipping; the service will retry until 'claude' appears in PATH."
+    if [ -n "$other" ]; then
+      warn "skipping; the service will keep using $other."
+    else
+      warn "skipping; the service will retry until 'claude' appears in PATH."
+    fi
     return 0
   }
   say "running: curl -fsSL https://claude.ai/install.sh | bash"
   curl -fsSL https://claude.ai/install.sh | bash
-  have claude || warn "'claude' still not in PATH; open a new shell, or add ~/.local/bin to PATH."
+
+  if ! native_claude; then
+    warn "the official installer did not leave a copy in ~/.local/bin."
+    [ -n "$other" ] && warn "the service will keep using $other."
+    return 0
+  fi
+
+  if [ -n "$other" ]; then
+    say "The service now uses ~/.local/bin/claude. The old copy at $other is"
+    say "unused but still installed; your shell may still find it first."
+    say "To remove it: $(removal_hint "$(realpath "$other" 2>/dev/null || echo "$other")")"
+  fi
 }
 
 # --- Prerequisite: a login Remote Control can actually use ------------------

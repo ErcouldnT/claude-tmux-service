@@ -186,8 +186,14 @@ cd claude-tmux-service
    — `pacman`, `apt-get`, `dnf`, `zypper`, `apk`, or `brew`. On a fresh Mac with
    no Homebrew it offers to install that first, since macOS ships no package
    manager and there is otherwise no way to get tmux.
-2. **installs Claude Code** if `claude` is not on `PATH`, with the official
-   installer (`curl -fsSL https://claude.ai/install.sh | bash`). No `sudo`.
+2. **installs Claude Code** with the official installer
+   (`curl -fsSL https://claude.ai/install.sh | bash`), unless that copy is
+   already there. No `sudo`. A Homebrew or npm copy does not count: those stay
+   on whatever version they were installed at, while the official one updates
+   itself in the background. So if one is found, the official copy goes in
+   next to it, the watchdog picks it up (`~/.local/bin` is first on its
+   `PATH`), and the installer prints the command to remove the old one — it
+   does not remove it for you. `--no-deps` leaves an existing copy alone.
 3. **checks that you are logged in**, and runs the login flow for you if you are
    not — see [Login](#login) below.
 4. copies `claude-remote-start.sh` to `~/.local/bin/`
@@ -322,7 +328,8 @@ logged-out state on its own.
 Handled for you by `install.sh`, listed here for reference:
 
 - **tmux**
-- **Claude Code** ≥ 2.1.51 (`claude --version`)
+- **Claude Code** ≥ 2.1.51 (`claude --version`), from the official installer so it
+  keeps itself up to date
 - a claude.ai **Pro or Max** login
 - Optional: **`nm-online`** (ships with NetworkManager; present on Arch,
   Raspberry Pi OS / Debian Bookworm+, Fedora, …) for the pre-spawn network

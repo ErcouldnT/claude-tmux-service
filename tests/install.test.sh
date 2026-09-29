@@ -64,7 +64,37 @@ AUTH_OK='{"loggedIn": true, "authMethod": "claude.ai", "email": "a@b.c", "subscr
 AUTH_NO='{"loggedIn": false}'
 AUTH_CONSOLE='{"loggedIn": true, "authMethod": "console", "email": "a@b.c"}'
 
-stub_claude() { mkstub claude "case \"\$*\" in 'auth status --json') echo '$1';; esac; exit 0"; }
+# A native (official-installer) Claude Code: the ~/.local/bin link plus the
+# ~/.local/share/claude directory, which is how install.sh tells it apart from
+# a Homebrew or npm copy.
+stub_claude() {
+  mkstub claude "case \"\$*\" in 'auth status --json') echo '$1';; esac; exit 0"
+  mkdir -p "$HOME_DIR/.local/share/claude"
+}
+
+# A package-manager copy: same behaviour, but in its own bin dir (named like
+# linuxbrew so the removal hint can be checked) and no ~/.local/share/claude.
+# Echoes the dir, for CLAUDE_TMUX_EXTRA_PATH.
+stub_brew_claude() {
+  bdir="$ROOT/$CASE/linuxbrew/bin"
+  mkdir -p "$bdir"
+  printf '#!/bin/sh\ncase "$*" in '"'"'auth status --json'"'"') echo '"'"'%s'"'"';; esac; exit 0\n' "$1" > "$bdir/claude"
+  chmod +x "$bdir/claude"
+  echo "$bdir"
+}
+
+# The official installer, faked: curl logs the call and prints a script that
+# lays down a native install; bash runs it. Stands in for
+# `curl -fsSL https://claude.ai/install.sh | bash`.
+stub_official_installer() {
+  cat > "$ROOT/$CASE/fake-install.sh" <<EOS
+mkdir -p "\$HOME/.local/share/claude/versions"
+printf '#!/bin/sh\ncase "\$*" in '"'"'auth status --json'"'"') echo '"'"'$1'"'"';; esac; exit 0\n' > "\$HOME/.local/bin/claude"
+chmod +x "\$HOME/.local/bin/claude"
+EOS
+  mkstub curl "echo \"curl \$*\" >> \"\$HOME/curl.log\"; cat '$ROOT/$CASE/fake-install.sh'"
+  mkstub bash 'exec sh'
+}
 
 # ---------------------------------------------------------------- static ---
 echo "== static checks =="
@@ -92,8 +122,10 @@ mkstub tmux  'exit 0'
 stub_claude "$AUTH_OK"
 mkstub systemctl 'echo "systemctl $*" >> "$HOME/systemctl.log"; exit 0'
 mkstub loginctl  'echo "loginctl $*"  >> "$HOME/loginctl.log";  exit 0'
+mkstub curl 'echo "curl $*" >> "$HOME/curl.log"; exit 0'
 run -y
 check "exits 0"                "[ \"\$(rc)\" -eq 0 ]"
+check "native claude present: installer not run" "[ ! -e '$HOME_DIR/curl.log' ]"
 check "watchdog installed"     "[ -x '$HOME_DIR/.local/bin/claude-remote-start.sh' ]"
 check "systemd unit installed" "[ -f '$HOME_DIR/.config/systemd/user/claude-tmux.service' ]"
 check "linger enabled"         "grep -q 'enable-linger tester' '$HOME_DIR/loginctl.log'"
@@ -196,6 +228,50 @@ stub_claude "$AUTH_OK"
 run -y
 check "rejects unsupported OS" "grep -q \"unsupported OS 'Plan9'\" '$OUT'"
 check "exits non-zero"         "[ \"\$(rc)\" -ne 0 ]"
+
+# ---------------------------------- claude from a package manager, migrated ---
+# A Homebrew/npm copy does not update itself, so it is not "already installed":
+# the official one goes in next to it, and the old one is named, not removed.
+new_case brew_claude_migrates
+mkstub uname 'echo Linux'
+mkstub tmux 'exit 0'
+mkstub systemctl 'exit 0'
+mkstub loginctl 'exit 0'
+BREW=$(stub_brew_claude "$AUTH_OK")
+stub_official_installer "$AUTH_OK"
+run_env CLAUDE_TMUX_EXTRA_PATH="$BREW" -- -y
+check "exits 0"                          "[ \"\$(rc)\" -eq 0 ]"
+check "ran the official installer"       "grep -q 'claude.ai/install.sh' '$HOME_DIR/curl.log'"
+check "native claude now installed"      "[ -x '$HOME_DIR/.local/bin/claude' ] && [ -d '$HOME_DIR/.local/share/claude' ]"
+check "explains why it reinstalled"      "grep -q 'not by the official installer' '$OUT'"
+check "names the brew removal command"   "grep -q 'brew uninstall --cask claude-code' '$OUT'"
+check "leaves the brew copy in place"    "[ -x '$BREW/claude' ]"
+check "went on to install the service"   "[ -f '$HOME_DIR/.config/systemd/user/claude-tmux.service' ]"
+
+new_case brew_claude_nodeps
+mkstub uname 'echo Linux'
+mkstub tmux 'exit 0'
+mkstub systemctl 'exit 0'
+mkstub loginctl 'exit 0'
+BREW=$(stub_brew_claude "$AUTH_OK")
+mkstub curl 'echo "curl $*" >> "$HOME/curl.log"; exit 0'
+run_env CLAUDE_TMUX_EXTRA_PATH="$BREW" -- --no-deps -y
+check "exits 0"                     "[ \"\$(rc)\" -eq 0 ]"
+check "--no-deps installs nothing"  "[ ! -e '$HOME_DIR/curl.log' ]"
+check "warns it will not update"    "grep -q 'stay on its current version' '$OUT'"
+check "no native copy created"      "[ ! -e '$HOME_DIR/.local/bin/claude' ]"
+
+new_case claude_missing_installs
+mkstub uname 'echo Linux'
+mkstub tmux 'exit 0'
+mkstub systemctl 'exit 0'
+mkstub loginctl 'exit 0'
+stub_official_installer "$AUTH_OK"
+run -y
+check "exits 0"                     "[ \"\$(rc)\" -eq 0 ]"
+check "ran the official installer"  "grep -q 'claude.ai/install.sh' '$HOME_DIR/curl.log'"
+check "native claude installed"     "[ -x '$HOME_DIR/.local/bin/claude' ]"
+check "no removal hint when nothing was there" "! grep -q 'To remove it' '$OUT'"
 
 # --------------------------------------------------------------- idempotent ---
 new_case rerun
