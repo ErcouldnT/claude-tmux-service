@@ -48,7 +48,9 @@ new_case() {
 cmd=$1
 case "$cmd" in
   has-session)  [ -f "$STATE/session" ] ;;
-  new-session)  : > "$STATE/session"; printf '%s\n' "$*" >> "$STATE/cmd" ;;
+  # $STATE/dies stands in for a claude that exits the moment it starts: the
+  # session never comes to exist.
+  new-session)  [ -f "$STATE/dies" ] || : > "$STATE/session"; printf '%s\n' "$*" >> "$STATE/cmd" ;;
   kill-session) rm -f "$STATE/session" ;;
   capture-pane)
     # Three shapes, told apart by argument count: -E is pane_head asking for
@@ -156,6 +158,12 @@ fi
 STUB
   chmod +x "$STUBS/claude"
 }
+
+# auth_stub, already signed in.
+signed_in() { auth_stub; : > "$STATE/code_sent"; }
+
+abandoned() { cat "$HOME_DIR/.local/state/claude-tmux/abandoned-sessions" 2>/dev/null; }
+hook_file() { echo "$HOME_DIR/.local/state/claude-tmux/hooks.json"; }
 
 # A machine that finished onboarding long ago. The flag is written once and
 # never cleared, which is the trap: it says nothing about the token.
@@ -489,19 +497,45 @@ check "opting out does not resume"    '! spawn_cmd | grep -q -- "--resume"'
 check "opting out pins nothing"       '! spawn_cmd | grep -q -- "--session-id"'
 
 # --- a conversation that keeps failing to start is eventually abandoned -----
-# Most spawn failures have nothing to do with the transcript — no network, a
-# logout — so one is not enough to throw the conversation away. Three in a row
-# is, otherwise a transcript claude refuses to open wedges the service forever.
+# Only a failure the transcript could have caused counts toward that: claude
+# dying straight after start while signed in. Three in a row, and the watchdog
+# stops resuming it — otherwise a transcript claude cannot open wedges the
+# service forever.
 new_case resume_gives_up
+signed_in
+: > "$STATE/dies"
 pin_id 11111111-2222-3333-4444-555555555555
 write_transcript 11111111-2222-3333-4444-555555555555
-run_cmd start                                   # never ready: verification fails
+run_cmd start
 check "one failure keeps the conversation"  '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
 run_cmd start
 check "two failures keep it too"            '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
 run_cmd start
 check "the third gives up on it"            '[ -z "$(saved_id)" ]'
 check "and says so"                         'grep -q "starting a new one" "$OUT"'
+check "the id is archived, not lost"        'abandoned | grep -q 11111111-2222-3333-4444-555555555555'
+check "and the way back is logged"          'grep -q "claude --resume 11111111-2222-3333-4444-555555555555" "$OUT"'
+
+# --- failures that are not the transcript's never cost the conversation -----
+# The regression behind this: a trust prompt the watchdog could not answer
+# failed three spawns in a row, and those three were charged to the
+# conversation, which was dropped. Nothing about it was wrong.
+new_case resume_kept_when_never_ready
+signed_in
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd start; run_cmd start; run_cmd start; run_cmd start
+check "four banner-less spawns keep the conversation" '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+check "and charge nothing to it" '[ ! -f "$HOME_DIR/.local/state/claude-tmux/resume-failures" ]'
+
+# A fast exit while signed out is a logout, whatever is being resumed.
+new_case resume_kept_when_logged_out
+auth_stub
+: > "$STATE/dies"
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd start; run_cmd start; run_cmd start; run_cmd start
+check "exits while signed out keep the conversation" '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
 
 # --- claude rejecting the transcript is not worth three passes --------------
 new_case resume_rejected
@@ -521,16 +555,16 @@ check "and leaves no failure charged"         '[ ! -f "$HOME_DIR/.local/state/cl
 # Without this, three failures spread over a week would abandon a conversation
 # that has been working fine in between.
 new_case resume_fail_count_clears
+signed_in
 pin_id 11111111-2222-3333-4444-555555555555
 write_transcript 11111111-2222-3333-4444-555555555555
-run_cmd start                       # fails: no banner
-banner "$STATE/pane"
+: > "$STATE/dies"
+run_cmd start                       # fails: claude exits
+rm -f "$STATE/dies"; banner "$STATE/pane"
 run_cmd start                       # succeeds, clearing the count
-: > "$STATE/pane"
+rm -f "$STATE/session"; : > "$STATE/pane"; : > "$STATE/dies"
 run_cmd start                       # fails again — but as the first, not the second
-banner "$STATE/pane"
-run_cmd start
-
+run_cmd start                       # the second
 check "a working conversation is kept" '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
 
 # --- stop keeps the thread, reset drops it ----------------------------------
@@ -548,6 +582,53 @@ run_cmd reset
 check "reset kills the session"       '[ ! -f "$STATE/session" ]'
 check "reset forgets the conversation" '[ -z "$(saved_id)" ]'
 check "reset says what it did"        'grep -q "starts empty" "$OUT"'
+
+# --- each spawn carries the hook that reports the live conversation --------
+new_case hook_on_spawn
+banner "$STATE/pane"
+run_cmd start
+check "spawn passes --settings"        'spawn_cmd | grep -q -- "--settings $(hook_file)"'
+check "the settings are valid JSON"    'python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$(hook_file)"'
+check "they register a SessionStart hook" 'grep -q SessionStart "$(hook_file)"'
+check "which calls back into record-session" 'grep -q "record-session" "$(hook_file)"'
+check "naming the id file it writes"   'grep -q "$(id_file)" "$(hook_file)"'
+
+new_case hook_off_without_resume
+banner "$STATE/pane"
+run_cmd start env CLAUDE_TMUX_RESUME=0
+check "no resume, no hook"             '! spawn_cmd | grep -q -- "--settings"'
+
+# --- the hook records the id it is given -------------------------------------
+new_case record_session
+pin_id 11111111-2222-3333-4444-555555555555
+echo 2 > "$HOME_DIR/.local/state/claude-tmux/resume-failures"
+run_cmd_in '{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","source":"clear"}' record-session
+check "exits 0"                        '[ "$RC" -eq 0 ]'
+check "records the new conversation"   '[ "$(saved_id)" = aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee ]'
+check "prints nothing (it would land in the conversation)" '[ ! -s "$OUT" ]'
+check "a new conversation starts with no failures charged" '[ ! -f "$HOME_DIR/.local/state/claude-tmux/resume-failures" ]'
+
+new_case record_session_junk
+pin_id 11111111-2222-3333-4444-555555555555
+run_cmd_in '{"session_id":"$(rm -rf /)","source":"clear"}' record-session
+check "junk is ignored"                '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+check "and still exits 0"              '[ "$RC" -eq 0 ]'
+run_cmd_in 'not json at all' record-session
+check "so is a payload with no id"     '[ "$(saved_id)" = 11111111-2222-3333-4444-555555555555 ]'
+
+# --- after a /clear, the next restart comes back to the new conversation ----
+# The bug this exists for: the id was pinned once at spawn, a /clear from the
+# phone moved claude to a new conversation, and every restart after that
+# resumed the old one.
+new_case follows_clear
+pin_id 11111111-2222-3333-4444-555555555555
+write_transcript 11111111-2222-3333-4444-555555555555
+run_cmd_in '{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","source":"clear"}' record-session
+write_transcript aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+banner "$STATE/pane"
+run_cmd start
+check "resumes the post-/clear conversation" 'spawn_cmd | grep -q -- "--resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"'
+check "not the one before it"          '! spawn_cmd | grep -q 11111111-2222-3333-4444-555555555555'
 
 echo
 echo "claude-remote-start.sh — status"
@@ -648,6 +729,17 @@ run_cmd status
 check "a failed status bar outranks a stale banner" '[ "$RC" -eq 1 ]'
 check "status names the failed registration"        'grep -q "registration FAILED" "$OUT"'
 
+# --- a Claude Code that does not show its registration at all --------------
+new_case status_chrome_only
+: > "$STATE/session"
+echo 0 > "$STATE/hist"
+printf 'a long conversation\n' > "$STATE/screen"
+printf '  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on \xc2\xb7 1 shell \xc2\xb7 \xe2\x86\x90 for agents\n' >> "$STATE/screen"
+: > "$STATE/head"
+run_cmd status
+check "reports unconfirmed, not failed" '[ "$RC" -eq 2 ]'
+check "and says why"                    'grep -q "not shown by this Claude Code" "$OUT"'
+
 echo
 echo "claude-remote-start.sh — health checks on a running session"
 
@@ -737,6 +829,20 @@ check "a session stuck on unknown is recycled" '[ ! -f "$STATE/session" ]'
 check "and the pass reports failure"           '[ "$RC" -ne 0 ]'
 check "the log says the bar is unreadable"     'grep -q "without a readable" "$OUT"'
 check "the user is told"                       'grep -q "stopped reporting its status" "$STATE/notify"'
+
+# --- a working session is not recycled for hiding its registration ----------
+# Current Claude Code shows no "/rc" at all, and draws on the alternate screen,
+# so the banner is gone once it scrolls. A session busy for half an hour was
+# recycled mid-task for that. Its own prompt chrome on screen says nothing is
+# covering it, which is what the unknown strikes are really about.
+new_case health_unknown_with_chrome
+: > "$STATE/session"
+printf 'working on something long\n' > "$STATE/screen"
+printf '  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to cycle) \xc2\xb7 esc to interrupt\n' >> "$STATE/screen"
+: > "$STATE/head"
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_UNKNOWN_STRIKES=1
+check "a busy session with its chrome up survives" '[ -f "$STATE/session" ]'
+check "and nothing is logged"                      '[ ! -s "$OUT" ]'
 
 # --- that tolerance can be switched off too ----------------------------------
 new_case health_unknown_disabled

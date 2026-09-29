@@ -48,6 +48,10 @@
 #   CLAUDE_TMUX_RESUME_GATE  menu text of the prompt claude raises before
 #                            resuming a large conversation
 #                            (default: Resume from summary)
+#   CLAUDE_TMUX_CHROME       |-separated status-bar text that means claude's
+#                            own prompt is on screen, i.e. nothing covers it
+#                            (default: bypass permissions|for shortcuts|
+#                            shift+tab to cycle|esc to interrupt)
 set -u
 
 # Cover the common install locations across distros and macOS:
@@ -75,6 +79,7 @@ HEALTH="${CLAUDE_TMUX_HEALTH:-300}"
 HEALTH_STRIKES="${CLAUDE_TMUX_HEALTH_STRIKES:-2}"
 UNKNOWN_STRIKES="${CLAUDE_TMUX_UNKNOWN_STRIKES:-6}"
 RESUME_GATE="${CLAUDE_TMUX_RESUME_GATE:-Resume from summary}"
+CHROME="${CLAUDE_TMUX_CHROME:-bypass permissions|for shortcuts|shift+tab to cycle|esc to interrupt}"
 
 # How often to re-read the pane while verifying a fresh spawn.
 VERIFY_STEP=5
@@ -98,6 +103,15 @@ SESSION_ID_FILE="$STATE_DIR/session-id"
 # open would otherwise be retried forever; see resume_failed.
 RESUME_FAIL_FILE="$STATE_DIR/resume-failures"
 RESUME_FAIL_LIMIT=3
+# Conversations the watchdog stopped resuming, one "<time> <id>" per line. The
+# transcript is never deleted — only the pointer to it — so this is the list to
+# read when a conversation seems to have vanished.
+ABANDONED_FILE="$STATE_DIR/abandoned-sessions"
+# Settings handed to every spawn: a SessionStart hook that records which
+# conversation claude is in *now*. See record_session.
+HOOK_FILE="$STATE_DIR/hooks.json"
+# This script, absolute, for the hook to call back into.
+SELF="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)/$(basename -- "$0")"
 # Where claude keeps its transcripts, one directory per working directory.
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
@@ -215,8 +229,62 @@ save_session_id() {
   return 0
 }
 
+# Stop resuming the pinned conversation. Only the pointer goes: the transcript
+# stays where claude wrote it, and its id is appended to $ABANDONED_FILE and
+# logged, so "the conversation vanished" is always one `claude --resume` away
+# from being undone.
 forget_session_id() {
+  _old=$(saved_session_id) || _old=""
+  if [ -n "$_old" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null &&
+      printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$_old" >> "$ABANDONED_FILE" 2>/dev/null
+    log "conversation $_old is kept on disk; reopen it with: claude --resume $_old"
+  fi
   rm -f "$SESSION_ID_FILE" "$RESUME_FAIL_FILE" 2>/dev/null
+  return 0
+}
+
+# --- following the conversation claude is actually in ----------------------
+#
+# The id pinned at spawn time is only right until the conversation changes
+# under it. /clear — typed from the phone as easily as here — starts a new
+# conversation with a new id, and nothing told the watchdog: the next respawn
+# resumed the conversation from *before* the /clear, and everything since
+# looked forgotten.
+#
+# claude says which conversation it is in through a SessionStart hook, which
+# fires at startup, on --resume, on /clear and after compaction, with the
+# current session_id on stdin. Each spawn is handed a settings file carrying
+# that hook (--settings adds to the user's own settings; it replaces nothing),
+# and the hook calls back into this script to record the id. A claude started
+# by hand in a terminal gets no such hook, so it can never repoint the service.
+
+# POSIX single-quoting, for building the hook's shell command.
+sh_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+write_hook_settings() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+  _cmd="$(sh_quote "$SELF") record-session $(sh_quote "$SESSION_ID_FILE")"
+  _cmd=$(printf '%s' "$_cmd" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"%s"}]}]}}\n' \
+    "$_cmd" > "$HOOK_FILE" 2>/dev/null
+}
+
+# The hook's side: read claude's JSON from stdin and record its session_id in
+# $1. Silent on stdout — SessionStart output is added to the conversation — and
+# always successful, so a malformed payload can never get in claude's way.
+record_session() {
+  _file=${1:-$SESSION_ID_FILE}
+  _id=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  valid_uuid "${_id:-}" || return 0
+  _prev=""
+  [ -f "$_file" ] && read -r _prev < "$_file" 2>/dev/null
+  mkdir -p "$(dirname -- "$_file")" 2>/dev/null
+  printf '%s\n' "$_id" > "$_file" 2>/dev/null
+  # A failure count belongs to the conversation it was charged to.
+  [ "${_prev:-}" = "$_id" ] || rm -f "$(dirname -- "$_file")/resume-failures" 2>/dev/null
   return 0
 }
 
@@ -268,6 +336,9 @@ set_resume_args() {
 # a row; a caller that knows claude rejected the transcript passes `now`.
 resume_failed() {
   [ "$RESUMING" -eq 1 ] || return 0
+  if [ "${1:-}" != now ] && ! transcript_suspect; then
+    return 0
+  fi
   if [ "${1:-}" = now ]; then
     log "claude could not reopen the previous conversation; starting a new one"
     forget_session_id
@@ -298,10 +369,32 @@ resume_succeeded() {
   return 0
 }
 
+# Could the conversation be why this spawn failed? Only one failure points
+# there: claude dying on its own, straight after start, while signed in. A
+# logout, a stuck first-run menu, an expired token or a banner that never
+# showed all fail every spawn alike, whatever it resumes — and counting those
+# is how a trust prompt this script mis-answered cost a whole conversation.
+# FAIL_KIND is set by verify_session.
+FAIL_KIND=""
+transcript_suspect() {
+  [ "$FAIL_KIND" = exited ] || return 1
+  # The usual reason for a fast exit is a logout, which is not the
+  # transcript's fault either.
+  claude auth status --json 2>/dev/null |
+    grep -q '"loggedIn"[[:space:]]*:[[:space:]]*true'
+}
+
 die() {
   log "$*"
   exit 1
 }
+
+# The SessionStart hook calling back in. Handled before anything else, since it
+# runs inside claude and must neither fail nor print.
+if [ "${1:-}" = record-session ]; then
+  record_session "${2:-}"
+  exit 0
+fi
 
 command -v tmux >/dev/null 2>&1 || die "tmux not found in PATH"
 
@@ -404,6 +497,32 @@ registration_state() {
     return 0
   fi
   echo unknown
+}
+
+# Is claude's own prompt chrome — the permission-mode line under the input box —
+# on the bottom lines of the screen? Then claude is up and nothing is covering
+# it: not wedged behind a full-screen prompt, which is what the "unknown"
+# strikes below exist to catch.
+#
+# This matters because the registration marker is gone. Claude Code no longer
+# paints "/rc" in its status bar, busy or idle, and it draws on the alternate
+# screen, so there is no scrollback for the startup banner to survive in: a
+# healthy session reads "unknown" from the moment the banner scrolls off. Left
+# to the strike count, that recycled every session after half an hour of work
+# — mid-task — and, with the conversation pointer as it was, back into the
+# wrong conversation.
+chrome_visible() {
+  _bar=$(pane_status)
+  _rest=$CHROME
+  while [ -n "$_rest" ]; do
+    _pat=${_rest%%|*}
+    [ -n "$_pat" ] && contains "$_bar" "$_pat" && return 0
+    case "$_rest" in
+      *"|"*) _rest=${_rest#*|} ;;
+      *) _rest="" ;;
+    esac
+  done
+  return 1
 }
 
 # A systemd *user* unit cannot order itself after the network:
@@ -531,6 +650,7 @@ answer_resume_gate() {
 # Control. Returns 0 once the banner appears; otherwise kills the session so
 # the next watchdog pass starts from a clean slate.
 verify_session() {
+  FAIL_KIND=""
   [ "$VERIFY" -gt 0 ] || return 0
 
   waited=0
@@ -549,6 +669,7 @@ verify_session() {
     # claude exiting this fast is almost always a login problem: Remote
     # Control refuses to start without a claude.ai subscription session.
     if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      FAIL_KIND=exited
       log "claude exited ${waited}s after starting."
       log "If this repeats, run 'claude' and check /login — Remote Control needs"
       log "a claude.ai Pro/Max login, not an API key."
@@ -582,6 +703,7 @@ verify_session() {
       log "claude reports it is not logged in; Remote Control cannot start."
       log "Run '$0 login' to sign in — it drives 'claude auth login' for you,"
       log "prints the URL, and takes the code you paste back."
+      FAIL_KIND=auth
       mark_logged_out
       notify_once "Logged out of claude.ai — run 'claude auth login' to restore Remote Control."
       tmux kill-session -t "$SESSION" 2>/dev/null
@@ -596,6 +718,7 @@ verify_session() {
       log "claude is waiting on its sign-in screen; this needs a person."
       log "Run '$0 login' — it walks the first-run setup, prints the URL, and"
       log "relays the code you paste back."
+      FAIL_KIND=auth
       mark_logged_out
       notify_once "Claude Code needs an interactive sign-in — run claude-remote-start.sh login"
       tmux kill-session -t "$SESSION" 2>/dev/null
@@ -626,25 +749,26 @@ verify_session() {
     # Nothing downstream reads the theme and nobody watches this pane, so take
     # "Auto (match terminal)" and leave the terminal's own colours alone.
     if [ "$theme_answered" -eq 0 ] && contains "$out" "Choose the text style"; then
-      answer_gate "Auto" "theme picker" "Choose the text style" || return 1
+      answer_gate "Auto" "theme picker" "Choose the text style" || { FAIL_KIND=gate; return 1; }
       theme_answered=1
       continue
     fi
 
     if [ "$trust_answered" -eq 0 ] && contains "$out" "trust this folder"; then
-      answer_gate "I trust this folder" "workspace trust prompt" "trust this folder" || return 1
+      answer_gate "I trust this folder" "workspace trust prompt" "trust this folder" || { FAIL_KIND=gate; return 1; }
       trust_answered=1
       continue
     fi
 
     if [ "$bypass_answered" -eq 0 ] && contains "$out" "Bypass Permissions mode"; then
-      answer_gate "Yes, I accept" "Bypass Permissions warning" "Bypass Permissions mode" || return 1
+      answer_gate "Yes, I accept" "Bypass Permissions warning" "Bypass Permissions mode" || { FAIL_KIND=gate; return 1; }
       bypass_answered=1
       continue
     fi
   done
 
   if [ "$rc_failed_seen" -eq 1 ]; then
+    FAIL_KIND=rc
     # The overwhelmingly common cause: the stored claude.ai token expired while
     # the machine was off or the service was down, so claude starts, runs
     # perfectly well as a local session, and simply never registers. Starting
@@ -654,6 +778,7 @@ verify_session() {
     log "recycling it. Usually an expired claude.ai token — a fresh start"
     log "refreshes it. If it keeps failing, run '$0 login'."
   else
+    FAIL_KIND=nobanner
     log "session '$SESSION' started but never showed '$READY' within ${VERIFY}s;"
     log "recycling it. If Claude Code renamed that banner, set CLAUDE_TMUX_READY."
   fi
@@ -722,6 +847,13 @@ session_healthy() {
   # recycle — the same repair, for a session that is just as stuck.
   if [ "$_state" != failed ]; then
     HEALTH_SEEN=0
+    # Unreadable, but claude's own prompt is in plain view: nothing is covering
+    # it, so this is the ordinary state of a working session on a Claude Code
+    # that no longer shows its registration — not a wedge.
+    if chrome_visible; then
+      UNKNOWN_SEEN=0
+      return 0
+    fi
     [ "$UNKNOWN_STRIKES" -gt 0 ] || return 0
     UNKNOWN_SEEN=$((UNKNOWN_SEEN + 1))
     [ "$UNKNOWN_SEEN" -ge "$UNKNOWN_STRIKES" ] || return 0
@@ -769,9 +901,22 @@ ensure_session() {
 
   set_resume_args
 
-  # shellcheck disable=SC2086 — ARGS and RESUME_ARGS are intentionally word-split
-  tmux new-session -d -s "$SESSION" -c "$HOME" \
-    claude --remote-control "$SESSION" $RESUME_ARGS $ARGS || {
+  # Built up in "$@" so the settings path stays one word even with a space in
+  # $HOME; RESUME_ARGS and ARGS are word-split on purpose.
+  set -- claude --remote-control "$SESSION"
+  # shellcheck disable=SC2086
+  [ -n "$RESUME_ARGS" ] && set -- "$@" $RESUME_ARGS
+  if [ "$RESUME" != 0 ]; then
+    if write_hook_settings; then
+      set -- "$@" --settings "$HOOK_FILE"
+    else
+      log "cannot write $HOOK_FILE; a /clear will not be followed across restarts"
+    fi
+  fi
+  # shellcheck disable=SC2086
+  set -- "$@" $ARGS
+
+  tmux new-session -d -s "$SESSION" -c "$HOME" "$@" || {
       log "tmux new-session failed, will retry"
       return 1
     }
@@ -1079,6 +1224,15 @@ case "${1:-run}" in
       echo "Usually an expired claude.ai token. The watchdog recycles the session"
       echo "on its own; '$0 stop' then 'start' does it now."
       exit 1
+    elif chrome_visible; then
+      # Exit 2 as below: claude is up and uncovered, but this version of it
+      # does not show whether Remote Control is registered.
+      echo "session '$SESSION': running; registration not shown by this Claude Code"
+      echo "version — check the Claude app."
+      if [ "$RESUME" != 0 ] && id=$(saved_session_id); then
+        echo "conversation $id — kept across restarts"
+      fi
+      exit 2
     elif history_trimmed; then
       # Exit 2, not 0 or 1: nothing is known to be wrong, but nothing is
       # confirmed either, and a caller should be able to tell those apart.
@@ -1091,6 +1245,6 @@ case "${1:-run}" in
     fi
     ;;
   *)
-    die "unknown command: $1 (expected run, start, stop, reset, status or login)"
+    die "unknown command: $1 (expected run, start, stop, reset, status, login or record-session)"
     ;;
 esac

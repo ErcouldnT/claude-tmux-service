@@ -43,16 +43,33 @@ The id is recorded rather than derived. `claude --continue` would take the most
 recent conversation in `$HOME`, which is just as likely to be one you started by
 hand in a terminal — the remote session would then wander into it.
 
+The pin follows the conversation, not just the spawn. `/clear` — from the phone
+as much as here — moves claude to a new conversation with a new id, and a pin
+set once at spawn time would bring every later restart back to the one *before*
+the `/clear`. So each spawn is started with `--settings` pointing at a small
+file under the state dir that adds a `SessionStart` hook (it adds to your own
+settings, it replaces nothing). claude fires that hook at startup, on resume,
+on `/clear` and after compaction, and it calls back into
+`claude-remote-start.sh record-session` to record the id it is in now. A claude
+started by hand never gets the hook, so it cannot repoint the service.
+
 Two escape hatches, because a pinned conversation is a thing that can go wrong:
 
 - A transcript claude refuses to open would otherwise wedge the service for
   good. If it says so outright the conversation is dropped at once; otherwise
-  three failed spawns in a row is enough, since most failures (no network, a
-  logout) have nothing to do with the transcript and one of those must not cost
-  you the history. Either way the next spawn starts a fresh conversation.
+  it is dropped after three spawns in a row where claude, *signed in*, dies
+  straight after starting — the one failure a transcript can cause. Everything
+  else (no network, a logout, an expired token, a first-run prompt the watchdog
+  could not answer, a banner that never showed) fails every spawn alike and is
+  not charged to the conversation: one such streak once cost a whole
+  conversation. Either way the next spawn starts a fresh conversation.
 - `claude-remote-start.sh reset` forgets it deliberately, for when you just want
   a clean slate. `stop` does **not** — stopping the session isn't the same as
   abandoning what it was doing.
+
+Dropping a conversation only drops the pointer. The transcript stays where
+claude wrote it, the id is appended to `~/.local/state/claude-tmux/abandoned-sessions`,
+and the log names the command that reopens it (`claude --resume <id>`).
 
 Set `CLAUDE_TMUX_RESUME=0` to go back to an empty session every time.
 
@@ -120,7 +137,8 @@ Two answers, because one is not enough:
    transcript that once discussed it contains the phrase verbatim.
 2. **An unreadable status bar is counted**, over `CLAUDE_TMUX_UNKNOWN_STRIKES`
    checks, and then the session is recycled. This is the backstop for the next
-   prompt, the one this script has not been taught yet.
+   prompt, the one this script has not been taught yet. It only counts while
+   claude's own prompt chrome is *not* on screen — see below.
 
 ### What counts as proof of registration
 
@@ -135,6 +153,17 @@ that has ever discussed its own registration carries both the banner and a
 `Remote Control disconnected` line in its history — neither of which says
 anything about the present. So the checks read the status bar first and fall
 back to the *opening* output; a phrase anywhere else is ignored.
+
+**Current Claude Code shows neither for long.** It no longer paints `/rc` in
+the status bar — busy or idle — and it draws on the alternate screen, so there
+is no scrollback for the startup banner to survive in. A healthy session
+therefore reads *unknown* as soon as the banner scrolls off, and counting that
+recycled every session after half an hour of work, mid-task. So an unknown
+reading is not counted while claude's own prompt chrome (the permission-mode
+line: `bypass permissions`, `? for shortcuts`, `esc to interrupt`, …, set by
+`CLAUDE_TMUX_CHROME`) is on the bottom lines: claude is up and nothing covers
+it. The cost is that a registration dropped *silently*, with the chrome still
+up, is no longer noticed on its own; a restart of the service picks it back up.
 
 When neither is conclusive the state is *unknown*. An unknown session is given
 a long leash — far longer than a failing one — because killing a working
@@ -421,6 +450,10 @@ CLAUDE_TMUX_UNKNOWN_STRIKES=6
 # override only if a future Claude Code release renames it
 CLAUDE_TMUX_RESUME_GATE=Resume from summary
 
+# |-separated text that means claude's own prompt chrome is on the bottom
+# lines, so an unreadable registration is not counted as a wedge
+CLAUDE_TMUX_CHROME=bypass permissions|for shortcuts|shift+tab to cycle|esc to interrupt
+
 # ceiling for the retry delay after repeated failures, seconds
 CLAUDE_TMUX_MAX_BACKOFF=300
 
@@ -481,8 +514,10 @@ tail -f ~/Library/Logs/claude-tmux.log
 ```
 The one check that distinguishes "a session exists" from "my phone can see it".
 Exit codes: `0` registered, `1` missing or running-but-not-registered, `2`
-running but unconfirmable. The second line names the pinned conversation, the
-one every restart reattaches to.
+running but unconfirmable — which, on a Claude Code that no longer shows its
+registration, is the normal reading once the banner has scrolled off. The
+second line names the pinned conversation, the one every restart reattaches
+to (after a `/clear`, the new one).
 
 **Start over with an empty conversation:**
 ```sh
