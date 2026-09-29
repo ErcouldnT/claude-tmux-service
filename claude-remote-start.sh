@@ -48,6 +48,11 @@
 #   CLAUDE_TMUX_RESUME_GATE  menu text of the prompt claude raises before
 #                            resuming a large conversation
 #                            (default: Resume from summary)
+#   CLAUDE_TMUX_REFRESH_AGE  restart an idle session once it is this old, to
+#                            renew its registration (default: 21600 seconds,
+#                            0 disables)
+#   CLAUDE_TMUX_REFRESH_IDLE ...but only after the conversation has been quiet
+#                            this long (default: 1800 seconds)
 #   CLAUDE_TMUX_CHROME       |-separated status-bar text that means claude's
 #                            own prompt is on screen, i.e. nothing covers it
 #                            (default: bypass permissions|for shortcuts|
@@ -79,6 +84,8 @@ HEALTH="${CLAUDE_TMUX_HEALTH:-300}"
 HEALTH_STRIKES="${CLAUDE_TMUX_HEALTH_STRIKES:-2}"
 UNKNOWN_STRIKES="${CLAUDE_TMUX_UNKNOWN_STRIKES:-6}"
 RESUME_GATE="${CLAUDE_TMUX_RESUME_GATE:-Resume from summary}"
+REFRESH_AGE="${CLAUDE_TMUX_REFRESH_AGE:-21600}"
+REFRESH_IDLE="${CLAUDE_TMUX_REFRESH_IDLE:-1800}"
 CHROME="${CLAUDE_TMUX_CHROME:-bypass permissions|for shortcuts|shift+tab to cycle|esc to interrupt}"
 
 # How often to re-read the pane while verifying a fresh spawn.
@@ -293,12 +300,14 @@ record_session() {
 # anything — into a clean fresh start instead of a spawn that exits instantly.
 # The glob covers every project directory rather than reproducing claude's
 # rule for encoding a path into a directory name.
-transcript_exists() {
+transcript_path() {
   for _t in "$CLAUDE_DIR"/projects/*/"$1.jsonl"; do
-    [ -f "$_t" ] && return 0
+    [ -f "$_t" ] && { echo "$_t"; return 0; }
   done
   return 1
 }
+
+transcript_exists() { transcript_path "$1" >/dev/null; }
 
 # Work out the flags that put the next spawn back into the pinned conversation.
 # Assigns two globals rather than printing them: RESUMING has to reach the
@@ -786,6 +795,47 @@ verify_session() {
   return 1
 }
 
+# --- periodic refresh --------------------------------------------------------
+#
+# A registration can drop while claude keeps running: the claude.ai token
+# behind it expires every few hours, and a fresh start is what renews it. The
+# checks above used to notice that from the status bar, but Claude Code no
+# longer shows it (see chrome_visible), so a drop now goes unseen. Rather than
+# guess at it, renew on a schedule: restart a session that is old enough and
+# idle. Restarting no longer costs anything — the conversation is resumed, the
+# one claude is actually in — so the only care needed is to never do it to a
+# session in use.
+#
+# "Idle" is judged from the conversation's transcript, which claude appends to
+# on every message; and a long-running tool call, which writes nothing until
+# it returns, is caught by claude's own "esc to interrupt" on the status bar.
+# Off when there is no pinned conversation to come back to (CLAUDE_TMUX_RESUME=0):
+# a restart would then really lose it.
+
+# mtime in epoch seconds: GNU stat, then BSD/macOS stat.
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# Is the running session due for a refresh? Sets REFRESH_WHY for the log.
+REFRESH_WHY=""
+refresh_due() {
+  [ "$REFRESH_AGE" -gt 0 ] || return 1
+  [ "$RESUME" != 0 ] || return 1
+  _rnow=$(date +%s 2>/dev/null) || return 1
+  _born=$(pane_prop '#{session_created}')
+  case "${_born:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ $((_rnow - _born)) -ge "$REFRESH_AGE" ] || return 1
+  _id=$(saved_session_id) || return 1
+  _t=$(transcript_path "$_id") || return 1
+  _m=$(file_mtime "$_t")
+  case "${_m:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ $((_rnow - _m)) -ge "$REFRESH_IDLE" ] || return 1
+  contains "$(pane_status)" "esc to interrupt" && return 1
+  REFRESH_WHY="up $(( (_rnow - _born) / 3600 ))h, idle $(( (_rnow - _m) / 60 ))m"
+  return 0
+}
+
 # Spawn verification only ever looks at a session on its way up. That leaves
 # the failure this service exists to prevent wide open: a session that came up
 # registered, lost the registration later — the token behind it expires every
@@ -828,6 +878,15 @@ session_healthy() {
   if resume_gate_up; then
     answer_resume_gate
     return 0
+  fi
+
+  if refresh_due; then
+    log "refreshing session '$SESSION' ($REFRESH_WHY) to renew its Remote Control"
+    log "registration; the conversation is resumed."
+    HEALTH_SEEN=0
+    UNKNOWN_SEEN=0
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    return 1
   fi
 
   _state=$(registration_state)

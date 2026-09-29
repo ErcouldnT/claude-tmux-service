@@ -71,6 +71,9 @@ case "$cmd" in
     case "$5" in
       '#{history_size}')  cat "$STATE/hist" ;;
       '#{history_limit}') cat "$STATE/limit" ;;
+      # When the session was created; a session with no recorded birth was
+      # born just now, so it is never old enough to refresh.
+      '#{session_created}') cat "$STATE/created" 2>/dev/null || date +%s ;;
       *) echo "stub tmux: unexpected format: $5" >&2; exit 64 ;;
     esac
     ;;
@@ -161,6 +164,18 @@ STUB
 
 # auth_stub, already signed in.
 signed_in() { auth_stub; : > "$STATE/code_sent"; }
+
+# Backdate file $2 by $1 seconds. GNU date, then BSD: these tests run on macOS too.
+age_file() {
+  _ts=$(date -d "@$(( $(date +%s) - $1 ))" +%Y%m%d%H%M.%S 2>/dev/null ||
+        date -r "$(( $(date +%s) - $1 ))" +%Y%m%d%H%M.%S 2>/dev/null)
+  touch -t "$_ts" "$2"
+}
+transcript_file() { echo "$HOME_DIR/.claude/projects/-home-tester/$1.jsonl"; }
+born_ago() { echo "$(( $(date +%s) - $1 ))" > "$STATE/created"; }
+# claude's bar when idle, and when working on something.
+idle_bar() { printf '  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on \xc2\xb7 1 shell\n' >> "$1"; }
+busy_bar() { printf '  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to cycle) \xc2\xb7 esc to interrupt\n' >> "$1"; }
 
 abandoned() { cat "$HOME_DIR/.local/state/claude-tmux/abandoned-sessions" 2>/dev/null; }
 hook_file() { echo "$HOME_DIR/.local/state/claude-tmux/hooks.json"; }
@@ -843,6 +858,64 @@ printf '  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to cycle) \x
 run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_UNKNOWN_STRIKES=1
 check "a busy session with its chrome up survives" '[ -f "$STATE/session" ]'
 check "and nothing is logged"                      '[ ! -s "$OUT" ]'
+
+# --- an old, idle session is refreshed ---------------------------------------
+# The registration can drop silently and nothing on screen says so any more;
+# a fresh start renews it. Old enough and idle enough, the session is
+# restarted — and comes back in the same conversation.
+X=11111111-2222-3333-4444-555555555555
+refresh_setup() {
+  : > "$STATE/session"
+  pin_id $X
+  write_transcript $X
+  printf 'an ordinary conversation\n' > "$STATE/screen"
+  idle_bar "$STATE/screen"
+  born_ago 25200                            # up 7h
+  age_file 7200 "$(transcript_file $X)"     # last written 2h ago
+}
+
+new_case refresh_idle_old
+refresh_setup
+run_cmd start env CLAUDE_TMUX_HEALTH=1
+check "an old idle session is restarted"  '[ ! -f "$STATE/session" ]'
+check "the pass reports it, so the loop waits" '[ "$RC" -ne 0 ]'
+check "the log says why"                  'grep -q "refreshing session" "$OUT"'
+check "with its age and idle time"        'grep -q "up 7h, idle 120m" "$OUT"'
+check "the conversation is kept"          '[ "$(saved_id)" = $X ]'
+banner "$STATE/pane"
+run_cmd start
+check "and the respawn resumes it"        'spawn_cmd | grep -q -- "--resume $X"'
+
+new_case refresh_not_when_active
+refresh_setup
+touch "$(transcript_file $X)"             # written just now
+run_cmd start env CLAUDE_TMUX_HEALTH=1
+check "a session in use is left alone"    '[ -f "$STATE/session" ]'
+
+new_case refresh_not_when_young
+refresh_setup
+born_ago 3600                             # up 1h
+run_cmd start env CLAUDE_TMUX_HEALTH=1
+check "a young session is left alone"     '[ -f "$STATE/session" ]'
+
+# A long tool call writes nothing to the transcript until it returns, so the
+# transcript alone would call it idle. claude's own bar says otherwise.
+new_case refresh_not_when_busy
+refresh_setup
+printf 'running a long build\n' > "$STATE/screen"
+busy_bar "$STATE/screen"
+run_cmd start env CLAUDE_TMUX_HEALTH=1
+check "a busy session is left alone"      '[ -f "$STATE/session" ]'
+
+new_case refresh_not_without_resume
+refresh_setup
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_RESUME=0
+check "with nothing to resume, no refresh" '[ -f "$STATE/session" ]'
+
+new_case refresh_disabled
+refresh_setup
+run_cmd start env CLAUDE_TMUX_HEALTH=1 CLAUDE_TMUX_REFRESH_AGE=0
+check "CLAUDE_TMUX_REFRESH_AGE=0 disables it" '[ -f "$STATE/session" ]'
 
 # --- that tolerance can be switched off too ----------------------------------
 new_case health_unknown_disabled

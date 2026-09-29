@@ -162,8 +162,18 @@ recycled every session after half an hour of work, mid-task. So an unknown
 reading is not counted while claude's own prompt chrome (the permission-mode
 line: `bypass permissions`, `? for shortcuts`, `esc to interrupt`, …, set by
 `CLAUDE_TMUX_CHROME`) is on the bottom lines: claude is up and nothing covers
-it. The cost is that a registration dropped *silently*, with the chrome still
-up, is no longer noticed on its own; a restart of the service picks it back up.
+it.
+
+That leaves a registration dropped *silently*, with the chrome still up, with
+nothing on screen to give it away. So instead of detecting it, the watchdog
+renews it: a session that has been up for `CLAUDE_TMUX_REFRESH_AGE` (6 hours)
+is restarted once its conversation has been quiet for `CLAUDE_TMUX_REFRESH_IDLE`
+(30 minutes) — the same fresh start that renews an expired token. "Quiet" is
+read from the conversation's transcript, which claude appends to on every
+message, and a session showing `esc to interrupt` is never touched, since a
+long tool call writes nothing until it returns. It costs nothing: the respawn
+resumes the conversation claude was in. With `CLAUDE_TMUX_RESUME=0` there is
+nothing to come back to, so no refresh happens.
 
 When neither is conclusive the state is *unknown*. An unknown session is given
 a long leash — far longer than a failing one — because killing a working
@@ -449,6 +459,14 @@ CLAUDE_TMUX_UNKNOWN_STRIKES=6
 # conversation, which the watchdog answers with "Resume from summary"
 # override only if a future Claude Code release renames it
 CLAUDE_TMUX_RESUME_GATE=Resume from summary
+
+# restart a session this old (seconds) to renew its Remote Control
+# registration — only while idle, and back into the same conversation;
+# 0 never refreshes
+CLAUDE_TMUX_REFRESH_AGE=21600
+
+# ...and only once the conversation has been quiet this long (seconds)
+CLAUDE_TMUX_REFRESH_IDLE=1800
 
 # |-separated text that means claude's own prompt chrome is on the bottom
 # lines, so an unreadable registration is not counted as a wedge
