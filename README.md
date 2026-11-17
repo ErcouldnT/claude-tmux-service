@@ -497,6 +497,41 @@ Re-run `./install.sh` (or restart the service) after editing.
 > who can reach the session can run commands on it. To keep permission prompts,
 > set `CLAUDE_TMUX_ARGS=` (empty) in the config file.
 
+## Multiple accounts
+
+One machine can keep several Remote Control sessions alive at once, each signed
+in to a different claude.ai account. Every instance needs its own Claude config
+directory (that is where the sign-in lives), its own tmux session name, and its
+own state and config directories for the watchdog:
+
+```ini
+# ~/.config/systemd/user/claude-tmux-second.service — a copy of
+# claude-tmux.service with these lines added under [Service]
+Environment=CLAUDE_CONFIG_DIR=%h/.claude-second
+Environment=CLAUDE_TMUX_SESSION=my-box-second
+Environment=XDG_STATE_HOME=%h/.local/state/second
+Environment=XDG_CONFIG_HOME=%h/.config/second
+```
+
+Sign the new instance in before starting it, with the same variables set:
+
+```sh
+export CLAUDE_CONFIG_DIR=~/.claude-second CLAUDE_TMUX_SESSION=my-box-second \
+       XDG_STATE_HOME=~/.local/state/second XDG_CONFIG_HOME=~/.config/second
+~/.local/bin/claude-remote-start.sh login
+systemctl --user daemon-reload
+systemctl --user enable --now claude-tmux-second.service
+```
+
+Each instance shows up in the Claude app of its own account. Settings, MCP
+servers, plugins and conversation history are per config directory, so copy
+`settings.json` across if the instances should behave the same.
+
+All instances share one tmux server, and a new pane inherits the server's
+environment rather than the service's. The script therefore passes
+`CLAUDE_CONFIG_DIR` to claude explicitly; without that, every instance would
+silently run on the default account.
+
 ## Managing the service
 
 **Linux (systemd):**

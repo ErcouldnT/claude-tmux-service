@@ -122,6 +122,21 @@ SELF="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)/$(basename -- "$0
 # Where claude keeps its transcripts, one directory per working directory.
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
+# One machine can run several instances side by side, each signed in to its
+# own claude.ai account: give each its own CLAUDE_CONFIG_DIR, session name and
+# XDG dirs (see "Multiple accounts" in the README). The tmux server is shared
+# between them, though, and a new pane inherits the *server's* environment,
+# not ours — so a CLAUDE_CONFIG_DIR set on this script would never reach
+# claude, and every instance would quietly run on the default account. So
+# every tmux new-session that starts claude passes it on explicitly: the
+# watchdog's spawn prepends it to its argument list, and the login sessions
+# use this prefix (a path with spaces is not supported there).
+in_config_dir() {
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    echo env CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR"
+  fi
+}
+
 # A stuck setup — logged out, no network, a renamed banner — fails identically
 # on every retry, and each retry emits the same handful of lines. Left alone
 # that floods the log with hundreds of copies of one situation. So within a
@@ -975,6 +990,9 @@ ensure_session() {
   # shellcheck disable=SC2086
   set -- "$@" $ARGS
 
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] &&
+    set -- env CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" "$@"
+
   tmux new-session -d -s "$SESSION" -c "$HOME" "$@" || {
       log "tmux new-session failed, will retry"
       return 1
@@ -1028,7 +1046,12 @@ retry_delay() {
 
 LOGIN_SESSION="${SESSION}-login"
 LOGIN_BUDGET="${CLAUDE_TMUX_LOGIN_WAIT:-600}"
-ONBOARD_STATE="$HOME/.claude.json"
+# With CLAUDE_CONFIG_DIR set, claude keeps this file inside that directory.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  ONBOARD_STATE="$CLAUDE_CONFIG_DIR/.claude.json"
+else
+  ONBOARD_STATE="$HOME/.claude.json"
+fi
 
 login_pane() {
   tmux capture-pane -t "$LOGIN_SESSION" -p -J -S - 2>/dev/null
@@ -1123,11 +1146,11 @@ do_login() {
     # here" prompt.
     echo "Signing in to claude.ai..." >&2
     tmux new-session -d -s "$LOGIN_SESSION" -x 200 -y 50 -c "$HOME" \
-      claude auth login --claudeai || die "could not start the login session"
+      $(in_config_dir) claude auth login --claudeai || die "could not start the login session"
   else
     # shellcheck disable=SC2086 — ARGS is intentionally word-split
     tmux new-session -d -s "$LOGIN_SESSION" -x 200 -y 50 -c "$HOME" \
-      claude $ARGS || die "could not start the login session"
+      $(in_config_dir) claude $ARGS || die "could not start the login session"
     echo "Walking Claude Code's first-run setup..." >&2
   fi
 

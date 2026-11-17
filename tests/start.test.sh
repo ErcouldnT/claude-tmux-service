@@ -991,6 +991,35 @@ run_cmd_in "" login env CLAUDE_TMUX_LOGIN_WAIT=6
 check "an un-onboarded box walks the TUI" '! grep -q "auth login" "$STATE/cmd"'
 check "and says so"                       'grep -q "first-run setup" "$OUT"'
 
+# --- a second account on the same machine -----------------------------------
+# The tmux server is shared and hands a new pane its own environment, so a
+# CLAUDE_CONFIG_DIR on the service never reached claude: the "second" instance
+# ran on the first one's account, and Remote Control showed it under that one.
+new_case second_account_spawn
+banner "$STATE/pane"
+run_cmd start env CLAUDE_CONFIG_DIR="$HOME_DIR/.claude-second"
+
+check "second-account spawn verifies"      '[ "$RC" -eq 0 ]'
+check "claude gets its config dir"         'grep -q "env CLAUDE_CONFIG_DIR=$HOME_DIR/.claude-second claude --remote-control" "$STATE/cmd"'
+
+new_case default_account_spawn
+banner "$STATE/pane"
+run_cmd start
+
+check "default spawn verifies"             '[ "$RC" -eq 0 ]'
+check "and adds no env prefix"             '! grep -q "CLAUDE_CONFIG_DIR" "$STATE/cmd"'
+
+# Onboarding is recorded inside CLAUDE_CONFIG_DIR, not in ~/.claude.json, so
+# the login walk must read it from there — and sign in to that directory.
+new_case second_account_login
+mkdir -p "$HOME_DIR/.claude-second"
+echo '{"hasCompletedOnboarding": true}' > "$HOME_DIR/.claude-second/.claude.json"
+auth_stub
+run_cmd_in "" login env CLAUDE_TMUX_LOGIN_WAIT=6 CLAUDE_CONFIG_DIR="$HOME_DIR/.claude-second"
+
+check "reads onboarding from the config dir" 'grep -q "claude auth login" "$STATE/cmd"'
+check "signs in to that config dir"        'grep -q "env CLAUDE_CONFIG_DIR=$HOME_DIR/.claude-second claude auth login" "$STATE/cmd"'
+
 rm -rf "$ROOT"
 echo
 echo "$PASS passed, $FAIL failed"
