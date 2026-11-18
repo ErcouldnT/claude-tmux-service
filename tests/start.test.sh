@@ -47,11 +47,11 @@ new_case() {
 #!/bin/sh
 cmd=$1
 case "$cmd" in
-  has-session)  [ -f "$STATE/session" ] ;;
+  has-session)  printf '%s\n' "$*" >> "$STATE/targets"; [ -f "$STATE/session" ] ;;
   # $STATE/dies stands in for a claude that exits the moment it starts: the
   # session never comes to exist.
   new-session)  [ -f "$STATE/dies" ] || : > "$STATE/session"; printf '%s\n' "$*" >> "$STATE/cmd" ;;
-  kill-session) rm -f "$STATE/session" ;;
+  kill-session) printf '%s\n' "$*" >> "$STATE/targets"; rm -f "$STATE/session" ;;
   capture-pane)
     # Three shapes, told apart by argument count: -E is pane_head asking for
     # the opening history; a bare -p is pane_screen asking for the visible
@@ -1019,6 +1019,18 @@ run_cmd_in "" login env CLAUDE_TMUX_LOGIN_WAIT=6 CLAUDE_CONFIG_DIR="$HOME_DIR/.c
 
 check "reads onboarding from the config dir" 'grep -q "claude auth login" "$STATE/cmd"'
 check "signs in to that config dir"        'grep -q "env CLAUDE_CONFIG_DIR=$HOME_DIR/.claude-second claude auth login" "$STATE/cmd"'
+
+# --- a bare session name is a prefix match in tmux --------------------------
+# With "test" gone and "test-other" running, `has-session -t test` succeeds on
+# the other one: the watchdog sat on a session that did not exist and never
+# respawned it, and Remote Control archived it. Every target must be exact.
+new_case exact_targets
+banner "$STATE/pane"
+run_cmd start
+run_cmd stop
+
+check "session targets are exact matches"  '[ -s "$STATE/targets" ] && ! grep -v -- "-t =test" "$STATE/targets"'
+check "no pane target is a bare name"      '! grep -nE "tmux [a-z-]+( -p)? -t \"[^=]" "$REPO/claude-remote-start.sh"'
 
 rm -rf "$ROOT"
 echo

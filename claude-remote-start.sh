@@ -69,6 +69,10 @@ CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/claude-tmux/env"
 [ -f "$CONFIG" ] && . "$CONFIG"
 
 SESSION="${CLAUDE_TMUX_SESSION:-$(hostname -s)}"
+# Every tmux target below is written "=$SESSION" (or "=$SESSION:" for a pane):
+# a bare name is matched as a *prefix*. With a second instance named
+# "$SESSION-other" running and this one gone, has-session would find the other
+# one and the watchdog would never respawn, and kill-session would kill it.
 ARGS="${CLAUDE_TMUX_ARGS---dangerously-skip-permissions}"
 INTERVAL="${CLAUDE_TMUX_INTERVAL:-30}"
 VERIFY="${CLAUDE_TMUX_VERIFY:-60}"
@@ -423,14 +427,14 @@ fi
 command -v tmux >/dev/null 2>&1 || die "tmux not found in PATH"
 
 pane_text() {
-  tmux capture-pane -t "$SESSION" -p -S - 2>/dev/null
+  tmux capture-pane -t "=$SESSION:" -p -S - 2>/dev/null
 }
 
 # How much of the pane's opening output counts as "startup", for pane_head.
 HEAD_LINES=100
 
 pane_prop() {
-  tmux display-message -p -t "$SESSION" "$1" 2>/dev/null
+  tmux display-message -p -t "=$SESSION:" "$1" 2>/dev/null
 }
 
 # The banner is printed once, at startup, so it sits at the very top of the
@@ -446,7 +450,7 @@ pane_head() {
   if [ "$size" -le "$HEAD_LINES" ]; then
     pane_text
   else
-    tmux capture-pane -t "$SESSION" -p -S "-$size" -E "$((HEAD_LINES - size))" 2>/dev/null
+    tmux capture-pane -t "=$SESSION:" -p -S "-$size" -E "$((HEAD_LINES - size))" 2>/dev/null
   fi
 }
 
@@ -465,7 +469,7 @@ history_trimmed() {
 # way to tell whether a keypress advanced past a gate: the scrollback keeps
 # showing the gate either way.
 pane_screen() {
-  tmux capture-pane -t "$SESSION" -p 2>/dev/null
+  tmux capture-pane -t "=$SESSION:" -p 2>/dev/null
 }
 
 contains() {
@@ -583,7 +587,7 @@ MENU_CURSOR="❯"
 # Only the visible screen, and only the first cursor on it: a dismissed chooser
 # stays in the scrollback, and the prompt box draws the same mark below.
 menu_delta() {
-  tmux capture-pane -t "$1" -p 2>/dev/null | awk -v t="$2" -v c="$MENU_CURSOR" '
+  tmux capture-pane -t "=$1:" -p 2>/dev/null | awk -v t="$2" -v c="$MENU_CURSOR" '
     { n++ }
     !cur && (index($0, c) || $0 ~ /^[ \t]*> /) { cur = n }
     !tgt && index($0, t) { tgt = n }
@@ -606,13 +610,13 @@ menu_pick() {
     _d=$((0 - _d))
   fi
   while [ "$_d" -gt 0 ]; do
-    tmux send-keys -t "$1" "$_key"
+    tmux send-keys -t "=$1:" "$_key"
     sleep 1
     _d=$((_d - 1))
   done
   # Arrow keys only move the highlight, so unlike a digit they never advance
   # the screen on their own: the Enter here is always the one that answers.
-  tmux send-keys -t "$1" Enter
+  tmux send-keys -t "=$1:" Enter
   return 0
 }
 
@@ -625,7 +629,7 @@ answer_gate() {
     log "claude is waiting on the $2 for $HOME."
     log "Answer it once by hand, or drop CLAUDE_TMUX_AUTO_TRUST=0 to let the"
     log "watchdog answer it. claude saves the answer either way."
-    tmux kill-session -t "$SESSION" 2>/dev/null
+    tmux kill-session -t "=$SESSION" 2>/dev/null
     return 1
   fi
   log "answering the $2 for $HOME"
@@ -638,7 +642,7 @@ answer_gate() {
   # simply never comes online.
   log "could not find an entry matching '$1' on the $2;"
   log "if Claude Code reworded it, that string is what needs updating."
-  tmux kill-session -t "$SESSION" 2>/dev/null
+  tmux kill-session -t "=$SESSION" 2>/dev/null
   return 1
 }
 
@@ -692,7 +696,7 @@ verify_session() {
 
     # claude exiting this fast is almost always a login problem: Remote
     # Control refuses to start without a claude.ai subscription session.
-    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
       FAIL_KIND=exited
       log "claude exited ${waited}s after starting."
       log "If this repeats, run 'claude' and check /login — Remote Control needs"
@@ -719,7 +723,7 @@ verify_session() {
          contains "$out" "No session found" ||
          contains "$out" "Session not found"; }; then
       resume_failed now
-      tmux kill-session -t "$SESSION" 2>/dev/null
+      tmux kill-session -t "=$SESSION" 2>/dev/null
       return 1
     fi
 
@@ -730,7 +734,7 @@ verify_session() {
       FAIL_KIND=auth
       mark_logged_out
       notify_once "Logged out of claude.ai — run 'claude auth login' to restore Remote Control."
-      tmux kill-session -t "$SESSION" 2>/dev/null
+      tmux kill-session -t "=$SESSION" 2>/dev/null
       return 1
     fi
 
@@ -745,7 +749,7 @@ verify_session() {
       FAIL_KIND=auth
       mark_logged_out
       notify_once "Claude Code needs an interactive sign-in — run claude-remote-start.sh login"
-      tmux kill-session -t "$SESSION" 2>/dev/null
+      tmux kill-session -t "=$SESSION" 2>/dev/null
       return 1
     fi
 
@@ -806,7 +810,7 @@ verify_session() {
     log "session '$SESSION' started but never showed '$READY' within ${VERIFY}s;"
     log "recycling it. If Claude Code renamed that banner, set CLAUDE_TMUX_READY."
   fi
-  tmux kill-session -t "$SESSION" 2>/dev/null
+  tmux kill-session -t "=$SESSION" 2>/dev/null
   return 1
 }
 
@@ -900,7 +904,7 @@ session_healthy() {
     log "registration; the conversation is resumed."
     HEALTH_SEEN=0
     UNKNOWN_SEEN=0
-    tmux kill-session -t "$SESSION" 2>/dev/null
+    tmux kill-session -t "=$SESSION" 2>/dev/null
     return 1
   fi
 
@@ -936,7 +940,7 @@ session_healthy() {
     log "'tmux attach -t $SESSION' if this keeps happening."
     notify_once "Claude session stopped reporting its status — restarting it."
     UNKNOWN_SEEN=0
-    tmux kill-session -t "$SESSION" 2>/dev/null
+    tmux kill-session -t "=$SESSION" 2>/dev/null
     return 1
   fi
 
@@ -953,12 +957,12 @@ session_healthy() {
   log "refreshes it."
   notify_once "Remote Control registration dropped — restarting the Claude session."
   HEALTH_SEEN=0
-  tmux kill-session -t "$SESSION" 2>/dev/null
+  tmux kill-session -t "=$SESSION" 2>/dev/null
   return 1
 }
 
 ensure_session() {
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
+  if tmux has-session -t "=$SESSION" 2>/dev/null; then
     # Recycled: report the failure so the caller waits before respawning,
     # rather than racing the session it just killed.
     session_healthy || return 1
@@ -1054,13 +1058,13 @@ else
 fi
 
 login_pane() {
-  tmux capture-pane -t "$LOGIN_SESSION" -p -J -S - 2>/dev/null
+  tmux capture-pane -t "=$LOGIN_SESSION:" -p -J -S - 2>/dev/null
 }
 
 # Only the visible screen — see pane_screen. Gates are matched here, so a
 # dismissed menu sitting in the scrollback cannot be answered twice.
 login_screen() {
-  tmux capture-pane -t "$LOGIN_SESSION" -p 2>/dev/null
+  tmux capture-pane -t "=$LOGIN_SESSION:" -p 2>/dev/null
 }
 
 # Rebuild the sign-in URL from the pane.
@@ -1126,7 +1130,7 @@ setup_done() {
 }
 
 login_cleanup() {
-  tmux kill-session -t "$LOGIN_SESSION" 2>/dev/null
+  tmux kill-session -t "=$LOGIN_SESSION" 2>/dev/null
   return 0
 }
 
@@ -1167,13 +1171,13 @@ do_login() {
       # The watchdog backs off hard on a machine it cannot fix, so left alone
       # it would idle for minutes after the login is repaired. Dropping the
       # stale session makes the next pass rebuild it immediately.
-      tmux kill-session -t "$SESSION" 2>/dev/null
+      tmux kill-session -t "=$SESSION" 2>/dev/null
       echo "The watchdog will rebuild the session within ${INTERVAL}s." >&2
       echo "Check it with: $0 status" >&2
       return 0
     fi
 
-    if ! tmux has-session -t "$LOGIN_SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$LOGIN_SESSION" 2>/dev/null; then
       echo "The setup session exited before finishing." >&2
       [ "$code_sent" -eq 1 ] &&
         echo "The code may have been rejected — run this again for a fresh URL." >&2
@@ -1214,9 +1218,9 @@ do_login() {
 
       # -l sends it literally: the code carries a '#', which tmux would
       # otherwise read as the start of a format string.
-      tmux send-keys -t "$LOGIN_SESSION" -l "$code"
+      tmux send-keys -t "=$LOGIN_SESSION:" -l "$code"
       sleep 1
-      tmux send-keys -t "$LOGIN_SESSION" Enter
+      tmux send-keys -t "=$LOGIN_SESSION:" Enter
       code_sent=1
       echo "  code sent, waiting for claude to accept it" >&2
       sleep 8
@@ -1227,7 +1231,7 @@ do_login() {
     # the security notes — and both wait on Enter with nothing to choose.
     if contains "$screen" "Press Enter to continue"; then
       echo "  acknowledging a notice" >&2
-      tmux send-keys -t "$LOGIN_SESSION" Enter
+      tmux send-keys -t "=$LOGIN_SESSION:" Enter
       sleep 3
       continue
     fi
@@ -1273,18 +1277,18 @@ case "${1:-run}" in
     # The conversation id is deliberately left in place: stopping the session
     # is not the same as abandoning what it was doing, and `start` should pick
     # the thread back up. `reset` is how you ask for a clean slate.
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux kill-session -t "=$SESSION" 2>/dev/null || true
     ;;
   reset)
     forget_session_id
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux kill-session -t "=$SESSION" 2>/dev/null || true
     echo "conversation forgotten; the next session starts empty."
     ;;
   login)
     do_login
     ;;
   status)
-    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
       if [ -f "$LOGOUT_MARK" ]; then
         echo "session '$SESSION': not running — logged out of claude.ai."
         echo "Run '$0 login' with your Pro/Max account to restore it; it drives"
